@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-LightGBM 量化模型 - 训练脚本
+LightGBM 量化模型 - 训练脚本 (并行版)
 - 月度滚动训练 (Monthly Rolling)
 - 正确的横截面 Rank
 - 无 lookahead 风险
+- 多进程并行训练 (ProcessPoolExecutor)
 """
 
 import os
@@ -19,7 +20,7 @@ DATA_DIR = "data/daily"
 MODEL_DIR = "models_lgbm"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-N_JOBS = 16
+N_JOBS = 16  # 并行训练进程数
 
 # 股票筛选条件
 MIN_PRICE = 2.0
@@ -156,6 +157,7 @@ def load_all_data(files):
     """加载所有股票数据，合并成一个大表"""
     dfs = []
     
+    # 数据加载本身也可以并行，但这里先复用之前的逻辑
     with ProcessPoolExecutor(max_workers=N_JOBS) as executor:
         futures = {executor.submit(process_one_file, f): f for f in files}
         for future in tqdm(as_completed(futures), total=len(futures), desc="Loading"):
@@ -202,41 +204,37 @@ def prepare_regression_data(all_data, rank_features, label_col='future_ret_5'):
     return X, y
 
 
-def train_month_with_early_stopping(target_year, target_month, all_data, rank_features):
+def train_month_and_save(args):
     """
-    训练单月模型 (Rolling Window)
-    - 预测目标：target_year-target_month
-    - 训练数据：过去24个月
-      - Train: [M-25, M-2] (23个月)
-      - Valid: [M-1]    (1个月)
+    训练并保存单月模型 (Wrapper for parallel execution)
     """
+    year, month, all_data, rank_features = args
+    model_path = os.path.join(MODEL_DIR, f"lgbm_{year}{month:02d}.pkl")
+    
+    # 如果模型已存在，可以选择跳过
+    # if os.path.exists(model_path):
+    #     return f"{year}-{month:02d}: Skipped (Exists)"
     
     # 计算关键时间点
-    target_date = pd.Timestamp(f"{target_year}-{target_month}-01")
+    target_date = pd.Timestamp(f"{year}-{month}-01")
     
     # 验证集月份 (M-1)
     valid_start = target_date - pd.DateOffset(months=1)
-    valid_end = target_date - pd.Timedelta(days=1) # Valid直到上个月最后一天
+    valid_end = target_date - pd.Timedelta(days=1)
     
     # 训练集月份 (M-25 到 M-2)
     train_start = target_date - pd.DateOffset(months=25)
     train_end = valid_start - pd.Timedelta(days=1)
     
     # 筛选数据
-    # 注意：all_data['date'] 是 timestamp
     train_mask = (all_data['date'] >= train_start) & (all_data['date'] <= train_end)
     valid_mask = (all_data['date'] >= valid_start) & (all_data['date'] <= valid_end)
     
     train_data = all_data[train_mask]
     valid_data = all_data[valid_mask]
     
-    # 检查数据量
     if len(train_data) < 1000 or len(valid_data) < 100:
-        # print(f"  Insufficient data for {target_year}-{target_month:02d}")
-        return None
-    
-    # print(f"  Train: {len(train_data)} ({train_start.date()} to {train_end.date()})")
-    # print(f"  Valid: {len(valid_data)} ({valid_start.date()} to {valid_end.date()})")
+        return f"{year}-{month:02d}: Skipped (Insufficient Data)"
     
     # 准备回归数据
     X_train, y_train = prepare_regression_data(train_data, rank_features)
@@ -257,25 +255,38 @@ def train_month_with_early_stopping(target_year, target_month, all_data, rank_fe
         'bagging_fraction': 0.8,
         'bagging_freq': 5,
         'verbose': -1,
-        'n_jobs': 4, # 降低单模型并发，因为数据量小，且我们可能希望以后并行跑月份
+        'n_jobs': 1, # 并行训练时，单模型单线程，避免CPU过载
+        'num_threads': 1
     }
     
     # 训练
     model = lgb.train(
         params,
         train_set,
-        num_boost_round=1000, # 月度更新频繁，轮数可以稍减，或者靠 early_stopping
+        num_boost_round=1000,
         valid_sets=[train_set, valid_set],
         valid_names=['train', 'valid'],
-        callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)] # 关闭详细日志
+        callbacks=[lgb.early_stopping(stopping_rounds=50), lgb.log_evaluation(period=0)]
     )
     
-    return model
+    # 保存
+    model_data = {
+        'model': model,
+        'features': rank_features,
+        'best_iteration': model.best_iteration,
+        'best_score': model.best_score
+    }
+    joblib.dump(model_data, model_path)
+    
+    # 提取验证集分数
+    val_score = model.best_score.get('valid', {}).get('rmse', 0.0)
+    
+    return f"{year}-{month:02d}: Done (Score: {val_score:.4f})"
 
 
 def main():
     print("=" * 60)
-    print("LightGBM Regression - Monthly Rolling Training")
+    print("LightGBM Regression - Monthly Rolling Training (Parallel)")
     print("=" * 60)
     
     # 获取所有文件
@@ -297,39 +308,33 @@ def main():
     print("\nStep 2: Adding cross-sectional rank features...")
     all_data, rank_features = add_cross_sectional_rank(all_data)
     
-    # Step 3: 月度训练
-    print("\nStep 3: Training monthly models...")
+    # Step 3: 月度训练 (并行)
+    print("\nStep 3: Training monthly models (Parallel)...")
     
-    # 生成月份列表：2003-01 到 2025-12
-    # 我们需要前24个月做第一次训练，所以从2003年开始
     start_date = pd.Timestamp("2003-01-01")
     end_date = pd.Timestamp("2025-12-01")
     
     current_date = start_date
-    months_to_train = []
+    tasks = []
+    
     while current_date <= end_date:
-        months_to_train.append((current_date.year, current_date.month))
+        tasks.append((current_date.year, current_date.month, all_data, rank_features))
         current_date += pd.DateOffset(months=1)
         
-    print(f"Total months to train: {len(months_to_train)}")
+    print(f"Total months to train: {len(tasks)}")
+    print(f"Parallel jobs: {N_JOBS}")
     
-    for year, month in tqdm(months_to_train, desc="Training Months"):
-        model_path = os.path.join(MODEL_DIR, f"lgbm_{year}{month:02d}.pkl")
+    # 使用 ProcessPoolExecutor 并行训练
+    # 注意：all_data 会通过 fork (Linux) 共享内存，不会有巨大的 pickle 开销
+    with ProcessPoolExecutor(max_workers=N_JOBS) as executor:
+        futures = [executor.submit(train_month_and_save, task) for task in tasks]
         
-        # 如果模型已存在，可以选择跳过
-        # if os.path.exists(model_path):
-        #     continue
-            
-        model = train_month_with_early_stopping(year, month, all_data, rank_features)
-        
-        if model is not None:
-            model_data = {
-                'model': model,
-                'features': rank_features,
-                'best_iteration': model.best_iteration,
-                'best_score': model.best_score
-            }
-            joblib.dump(model_data, model_path)
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Training"):
+            try:
+                res = future.result()
+                # print(res) # 可选：打印每个任务的结果
+            except Exception as e:
+                print(f"Task failed: {e}")
     
     print("\nAll monthly models trained!")
 

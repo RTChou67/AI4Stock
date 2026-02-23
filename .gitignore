@@ -9,5 +9,5 @@ wheels/
 # Virtual environments
 .venv
 
-./models*
-./data
+models_lgbm/
+data/
