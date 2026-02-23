@@ -181,41 +181,37 @@ def load_all_data(files):
     return all_data
 
 
+def _rank_single_column(args):
+    """辅助函数：单列rank计算（用于并行）"""
+    col, dates_values = args
+    dates, values = dates_values
+    # 创建临时DataFrame用于groupby
+    df = pd.DataFrame({'date': dates, 'value': values})
+    rank_result = df.groupby('date')['value'].rank(pct=True, method='average')
+    return col, rank_result.values
+
+
 def add_cross_sectional_rank(all_data):
     """
-    添加横截面排名特征 (使用库自带并行)
+    添加横截面排名特征 (使用 joblib.Parallel 并行)
     关键：在所有股票之间做rank，不是单只股票
     """
+    print("Adding cross-sectional rank features (joblib.Parallel)...")
+    
     rank_features = [f'{c}_rank' for c in BASE_FEATURES]
     
-    if HAS_PANDARALLEL:
-        # 方案 1: 使用 pandarallel (推荐，最快)
-        print("Adding cross-sectional rank features (pandarallel)...")
-        pandarallel.initialize(nb_workers=N_JOBS, progress_bar=True, verbose=0)
-        
-        for col in BASE_FEATURES:
-            rank_col = f'{col}_rank'
-            all_data[rank_col] = all_data.groupby('date')[col].parallel_apply(
-                lambda x: x.rank(pct=True, method='average')
-            )
-    else:
-        # 方案 2: 使用 joblib.Parallel 并行处理各特征
-        print("Adding cross-sectional rank features (joblib.Parallel)...")
-        
-        def compute_rank_for_feature(col):
-            """计算单个特征的 rank"""
-            return all_data.groupby('date')[col].transform(
-                lambda x: x.rank(pct=True, method='average')
-            )
-        
-        # 并行计算所有特征的 rank
-        results = Parallel(n_jobs=N_JOBS, backend='threading')(
-            delayed(compute_rank_for_feature)(col) for col in BASE_FEATURES
-        )
-        
-        # 将结果赋值回 DataFrame
-        for col, rank_series in zip(BASE_FEATURES, results):
-            all_data[f'{col}_rank'] = rank_series
+    # 准备数据：提取日期和特征值
+    dates = all_data['date'].values
+    args_list = [(col, (dates, all_data[col].values)) for col in BASE_FEATURES]
+    
+    # 使用 joblib.Parallel 并行计算所有特征的 rank
+    results = Parallel(n_jobs=N_JOBS, backend='loky', verbose=1)(
+        delayed(_rank_single_column)(args) for args in args_list
+    )
+    
+    # 将结果赋值回 DataFrame
+    for col, rank_values in results:
+        all_data[f'{col}_rank'] = rank_values
     
     return all_data, rank_features
 

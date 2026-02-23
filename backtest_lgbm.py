@@ -30,9 +30,9 @@ START_YEAR = 2003
 END_YEAR = 2025
 
 # 选股参数
-TOP_N = 20           # 目标持仓数量
+TOP_N = 10           # 目标持仓数量
 KEEP_TOP_N = 30      # 缓冲期：排名跌出30才卖出（降低换手）
-REBALANCE_DAYS = 5   # 调仓频率 (交易日)
+REBALANCE_DAYS = 5   # 调仓频率 (交易日)，与训练标签 future_ret_5 匹配
 
 # 资金与风控
 INITIAL_CASH = 1_000_000
@@ -333,9 +333,69 @@ def analyze_ic(predictions):
     return ic_series, rolling_ic_20, rolling_ic_60, cumulative_ic
 
 
-def backtest(signals, price_df, pre_close_df, amount_df, pct_change_df):
+def calculate_yearly_ic_and_top10_stats(predictions, top_n=10):
     """
-    执行回测 (串行)
+    按年计算IC统计和Top N收益分布
+    
+    输出: year, ic_mean, ic_std, top10_mean_ret, top10_median_ret, top10_pct_positive
+    """
+    if predictions.empty:
+        return pd.DataFrame()
+    
+    print("Calculating yearly IC and Top10 return stats...")
+    
+    predictions = predictions.copy()
+    predictions['date'] = pd.to_datetime(predictions['date'])
+    predictions['year'] = predictions['date'].dt.year
+    
+    results = []
+    
+    for year, year_data in predictions.groupby('year'):
+        # 1. 计算每日IC
+        daily_ic = year_data.groupby('date').apply(
+            lambda x: x['pred_ret'].corr(x['future_ret_5'], method='spearman')
+        ).dropna()
+        
+        ic_mean = daily_ic.mean() if len(daily_ic) > 0 else np.nan
+        ic_std = daily_ic.std() if len(daily_ic) > 0 else np.nan
+        
+        # 2. 计算每日Top N收益
+        daily_top_returns = []
+        for date, day_data in year_data.groupby('date'):
+            if len(day_data) >= top_n:
+                top_stocks = day_data.nlargest(top_n, 'pred_ret')
+                # 计算等权平均收益
+                avg_ret = top_stocks['future_ret_5'].mean()
+                daily_top_returns.append(avg_ret)
+        
+        if len(daily_top_returns) > 0:
+            top_returns = pd.Series(daily_top_returns)
+            top10_mean_ret = top_returns.mean()
+            top10_median_ret = top_returns.median()
+            top10_pct_positive = (top_returns > 0).mean()
+        else:
+            top10_mean_ret = np.nan
+            top10_median_ret = np.nan
+            top10_pct_positive = np.nan
+        
+        results.append({
+            'year': year,
+            'ic_mean': ic_mean,
+            'ic_std': ic_std,
+            'top10_mean_ret': top10_mean_ret,
+            'top10_median_ret': top10_median_ret,
+            'top10_pct_positive': top10_pct_positive,
+            'n_days_ic': len(daily_ic),
+            'n_days_top10': len(daily_top_returns)
+        })
+    
+    return pd.DataFrame(results).sort_values('year')
+
+
+def backtest(signals, price_df, pre_close_df, amount_df, pct_change_df, predictions=None):
+    """
+    执行回测 (串行，每年初重置)
+    如果提供 predictions，会计算每年的 IC 和 Top10 统计并合并到 yearly_summary
     """
     if signals.empty:
         print("No signals to backtest!")
@@ -351,16 +411,97 @@ def backtest(signals, price_df, pre_close_df, amount_df, pct_change_df):
     rebalance_set = set(rebalance_dates)
     
     print(f"Rebalance dates: {len(rebalance_dates)} (every {REBALANCE_DAYS} trading days)")
+    print(f"Annual Reset: ENABLED (Reset to {INITIAL_CASH:,.0f} at start of each year)")
     
     cash = INITIAL_CASH
     holdings = {}
     portfolio_values = []
     trades = []
     last_known_prices = {}
-    turnover_data = [] 
+    turnover_data = []
+    yearly_returns = []  # 记录每年收益 
+    
+    current_year_start_value = INITIAL_CASH  # 记录当年初始资金
+    current_year_max_value = INITIAL_CASH     # 记录当年最高市值（用于计算回撤）
+    current_year_turnover = 0.0               # 记录当年累计换手率
+    
+    # 预计算每年的 IC 和 Top10 统计（如果提供了 predictions）
+    yearly_ic_top10_stats = {}
+    if predictions is not None and not predictions.empty:
+        pred_df = predictions.copy()
+        pred_df['date'] = pd.to_datetime(pred_df['date'])
+        pred_df['year'] = pred_df['date'].dt.year
+        
+        for year, year_data in pred_df.groupby('year'):
+            # 每日IC
+            daily_ic = year_data.groupby('date').apply(
+                lambda x: x['pred_ret'].corr(x['future_ret_5'], method='spearman')
+            ).dropna()
+            
+            # 每日Top10收益
+            daily_top_returns = []
+            for date, day_data in year_data.groupby('date'):
+                if len(day_data) >= 10:
+                    top_stocks = day_data.nlargest(10, 'pred_ret')
+                    avg_ret = top_stocks['future_ret_5'].mean()
+                    daily_top_returns.append(avg_ret)
+            
+            if len(daily_top_returns) > 0:
+                top_returns = pd.Series(daily_top_returns)
+                yearly_ic_top10_stats[year] = {
+                    'ic_mean': daily_ic.mean() if len(daily_ic) > 0 else np.nan,
+                    'ic_std': daily_ic.std() if len(daily_ic) > 0 else np.nan,
+                    'top10_mean_ret': top_returns.mean(),
+                    'top10_median_ret': top_returns.median(),
+                    'top10_pct_positive': (top_returns > 0).mean()
+                }
     
     for i, date in enumerate(tqdm(trading_days, desc="Backtesting")):
         date_ts = pd.Timestamp(date)
+        
+        # --- Annual Reset Logic: 每年第一个交易日重置 ---
+        if i > 0:
+            prev_date = pd.Timestamp(trading_days[i-1])
+            if date_ts.year != prev_date.year:
+                # 注意：这里使用上一年的最后一天价格（last_known_prices）
+                # 因为上一年最后一个交易日循环结束时已经更新了 last_known_prices
+                year_end_value = cash
+                for sym, shares in holdings.items():
+                    price = last_known_prices.get(sym, 0)
+                    if price > 0:
+                        year_end_value += shares * price
+                
+                year_return = (year_end_value / current_year_start_value) - 1
+                year_max_drawdown = (current_year_max_value - year_end_value) / current_year_max_value if current_year_max_value > 0 else 0
+                
+                year_stats = {
+                    'year': prev_date.year,
+                    'start_value': current_year_start_value,
+                    'end_value': year_end_value,
+                    'return': year_return,
+                    'max_drawdown': year_max_drawdown,
+                    'turnover': current_year_turnover
+                }
+                
+                # 合并 IC 和 Top10 统计
+                if prev_date.year in yearly_ic_top10_stats:
+                    year_stats.update(yearly_ic_top10_stats[prev_date.year])
+                
+                yearly_returns.append(year_stats)
+                
+                print(f"\n[Year {prev_date.year} Summary] Return: {year_return:.2%}, End Value: {year_end_value:,.0f}, MaxDD: {year_max_drawdown:.2%}")
+                
+                # 重置到初始资金（记录 RESET 交易，但实际是账面重置）
+                # 注意：这里不实际卖出，只是账面重置，避免重复计算交易成本
+                # 实际的持仓已经在 year_end_value 中按 last_known_prices 估值了
+                
+                holdings = {}
+                cash = INITIAL_CASH
+                current_year_start_value = INITIAL_CASH
+                current_year_max_value = INITIAL_CASH
+                current_year_turnover = 0.0
+                last_known_prices = {}  # 清空历史价格缓存
+                print(f"[Year {date_ts.year} Start] Reset to INITIAL_CASH: {INITIAL_CASH:,.0f}\n")
         
         tradable_prices = {}
         day_amounts = {}
@@ -514,32 +655,108 @@ def backtest(signals, price_df, pre_close_df, amount_df, pct_change_df):
                     total_traded = buy_val_total + sell_val_total
                     turnover_rate = total_traded / (2 * pre_trade_nav)
                     turnover_data.append({'date': date, 'turnover': turnover_rate, 'buy': buy_val_total, 'sell': sell_val_total, 'nav': pre_trade_nav})
+                    current_year_turnover += turnover_rate  # 累计年度换手率
 
+        # 更新当年最高市值
+        if portfolio_value > current_year_max_value:
+            current_year_max_value = portfolio_value
+        
         portfolio_values.append({
             'date': date, 'value': portfolio_value, 'cash': cash,
             'holdings_value': holdings_value, 'holdings_count': len(holdings)
         })
     
-    return pd.DataFrame(portfolio_values), pd.DataFrame(trades), pd.DataFrame(turnover_data), pd.DataFrame()
-
-
-def calculate_metrics(df, turnover_df=None):
-    """计算回测指标"""
-    if df.empty: return {}
-    df = df.sort_values('date').copy()
-    df['returns'] = df['value'].pct_change()
+    # 处理最后一年的收益记录
+    if len(trading_days) > 0:
+        last_date = pd.Timestamp(trading_days[-1])
+        final_value = cash
+        for sym, shares in holdings.items():
+            price = last_known_prices.get(sym, 0)
+            if price > 0:
+                final_value += shares * price
+        
+        # 找到当年第一个交易日
+        first_day_of_year = None
+        for d in trading_days:
+            if pd.Timestamp(d).year == last_date.year:
+                first_day_of_year = pd.Timestamp(d)
+                break
+        
+        if first_day_of_year and current_year_start_value > 0:
+            year_return = (final_value / current_year_start_value) - 1
+            year_max_drawdown = (current_year_max_value - final_value) / current_year_max_value if current_year_max_value > 0 else 0
+            
+            year_stats = {
+                'year': last_date.year,
+                'start_value': current_year_start_value,
+                'end_value': final_value,
+                'return': year_return,
+                'max_drawdown': year_max_drawdown,
+                'turnover': current_year_turnover
+            }
+            
+            # 合并 IC 和 Top10 统计
+            if last_date.year in yearly_ic_top10_stats:
+                year_stats.update(yearly_ic_top10_stats[last_date.year])
+            
+            yearly_returns.append(year_stats)
     
-    total_return = (df['value'].iloc[-1] / df['value'].iloc[0]) - 1
-    years = (df['date'].iloc[-1] - df['date'].iloc[0]).days / 365.25
-    annual_return = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
-    volatility = df['returns'].std() * np.sqrt(252)
-    sharpe = (annual_return - 0.02) / volatility if volatility > 0 else 0
-    df['cummax'] = df['value'].cummax()
-    df['drawdown'] = (df['value'] - df['cummax']) / df['cummax']
-    max_drawdown = df['drawdown'].min()
-    win_rate = (df['returns'] > 0).mean()
+    yearly_df = pd.DataFrame(yearly_returns)
+    if not yearly_df.empty:
+        print("\n" + "=" * 60)
+        print("YEARLY RETURNS (Annual Reset)")
+        print("=" * 60)
+        for _, row in yearly_df.iterrows():
+            print(f"Year {int(row['year'])}: {row['return']:>8.2%} ({row['start_value']:>12,.0f} -> {row['end_value']:>12,.0f}), MaxDD: {row['max_drawdown']:>7.2%}, Turnover: {row['turnover']:>6.2%}")
+        print("-" * 60)
+        print(f"Average Annual Return: {yearly_df['return'].mean():.2%}")
+        print(f"Winning Years: {(yearly_df['return'] > 0).sum()}/{len(yearly_df)}")
+        print("=" * 60)
+    
+    return pd.DataFrame(portfolio_values), pd.DataFrame(trades), pd.DataFrame(turnover_data), yearly_df
+
+
+def calculate_metrics(yearly_df, turnover_df=None):
+    """
+    计算回测指标 (基于年度重置模式)
+    
+    参数:
+        yearly_df: DataFrame with columns ['year', 'start_value', 'end_value', 'return']
+        turnover_df: 换手率数据
+    """
+    if yearly_df.empty:
+        return {}
+    
+    # 年度收益率统计
+    yearly_returns = yearly_df['return'].values
+    years = len(yearly_returns)
+    
+    # 平均年化收益率 (算术平均)
+    annual_return = yearly_returns.mean()
+    
+    # 年度波动率 (年化收益率的标准差)
+    annual_volatility = yearly_returns.std()
+    
+    # 夏普比率 (假设无风险利率 2%)
+    risk_free_rate = 0.02
+    sharpe = (annual_return - risk_free_rate) / annual_volatility if annual_volatility > 0 else 0
+    
+    # 胜率 (正收益年份占比)
+    win_rate = (yearly_returns > 0).mean()
+    
+    # 最大回撤 (基于年度收益，这里定义为最大年度亏损)
+    max_drawdown = yearly_returns.min()
+    
+    # Calmar 比率 (年化收益 / 最大回撤的绝对值)
     calmar = annual_return / abs(max_drawdown) if max_drawdown != 0 else 0
     
+    # 总收益率 (几何平均的累计，从100万到最终)
+    total_return = np.prod(1 + yearly_returns) - 1
+    
+    # 复合年化收益率 (CAGR，几何平均)
+    cagr = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
+    
+    # 换手率
     turnover_metrics = {}
     if turnover_df is not None and len(turnover_df) > 0:
         turnover_df = turnover_df.copy()
@@ -550,9 +767,16 @@ def calculate_metrics(df, turnover_df=None):
         turnover_metrics['avg_annual_turnover'] = 0
     
     return {
-        'total_return': total_return, 'annual_return': annual_return, 'volatility': volatility,
-        'sharpe_ratio': sharpe, 'max_drawdown': max_drawdown, 'win_rate': win_rate,
-        'calmar_ratio': calmar, 'final_value': df['value'].iloc[-1], 'years': years,
+        'total_return': total_return,          # 累计总收益
+        'annual_return': annual_return,        # 平均年化收益 (算术)
+        'cagr': cagr,                          # 复合年化收益 (几何)
+        'annual_volatility': annual_volatility, # 年度波动率
+        'sharpe_ratio': sharpe,                # 夏普比率
+        'max_drawdown': max_drawdown,          # 最大年度回撤
+        'win_rate': win_rate,                  # 胜率
+        'calmar_ratio': calmar,                # Calmar 比率
+        'years': years,                        # 投资年数
+        'final_value': yearly_df['end_value'].iloc[-1],  # 最后一年结束价值
         **turnover_metrics
     }
 
@@ -680,34 +904,70 @@ def main():
     gc.collect()
     
     print("\nStep 4: Running backtest...")
-    results, trades, turnover_data, monthly_summary = backtest(
-        signals, price_df, pre_close_df, amount_df, pct_change_df
+    results, trades, turnover_data, yearly_summary = backtest(
+        signals, price_df, pre_close_df, amount_df, pct_change_df, predictions=signals
     )
     
     print("\nStep 5: Calculating metrics...")
-    metrics = calculate_metrics(results, turnover_data)
+    metrics = calculate_metrics(yearly_summary, turnover_data)
     
     print("\n" + "=" * 60)
-    print("BACKTEST RESULTS")
+    print("BACKTEST RESULTS (Annual Reset Mode)")
     print("=" * 60)
-    print(f"Period:           {metrics.get('years', 0):.1f} years")
-    print(f"Initial Value:    {INITIAL_CASH:>15,.0f}")
-    print(f"Final Value:      {metrics.get('final_value', 0):>15,.0f}")
-    print(f"Total Return:     {metrics.get('total_return', 0):>15.2%}")
-    print(f"Annual Return:    {metrics.get('annual_return', 0):>15.2%}")
-    print(f"Volatility:       {metrics.get('volatility', 0):>15.2%}")
-    print(f"Sharpe Ratio:     {metrics.get('sharpe_ratio', 0):>15.2f}")
-    print(f"Max Drawdown:     {metrics.get('max_drawdown', 0):>15.2%}")
-    print(f"Win Rate:         {metrics.get('win_rate', 0):>15.2%}")
-    print(f"Calmar Ratio:     {metrics.get('calmar_ratio', 0):>15.2f}")
+    print(f"Period:              {metrics.get('years', 0):>15.0f} years")
+    print(f"Initial Value:       {INITIAL_CASH:>15,.0f}")
+    print(f"Final Value:         {metrics.get('final_value', 0):>15,.0f}")
+    print("-" * 60)
+    print(f"CAGR (Geometric):    {metrics.get('cagr', 0):>15.2%}")
+    print(f"Avg Annual Return:   {metrics.get('annual_return', 0):>15.2%}")
+    print(f"Annual Volatility:   {metrics.get('annual_volatility', 0):>15.2%}")
+    print("-" * 60)
+    print(f"Sharpe Ratio:        {metrics.get('sharpe_ratio', 0):>15.2f}")
+    print(f"Max Annual Drawdown: {metrics.get('max_drawdown', 0):>15.2%}")
+    print(f"Win Rate (Years):    {metrics.get('win_rate', 0):>15.2%}")
+    print(f"Calmar Ratio:        {metrics.get('calmar_ratio', 0):>15.2f}")
     print("-" * 60)
     print(f"Avg Annual Turnover: {metrics.get('avg_annual_turnover', 0):>10.2%}")
     print("=" * 60)
+    
+    # 打印详细的年度总结表格（包含IC和Top10统计）
+    if not yearly_summary.empty:
+        print("\n" + "=" * 140)
+        print("ANNUAL SUMMARY")
+        print("=" * 140)
+        print(f"{'Year':>6} | {'Start':>10} | {'End':>10} | {'Return':>8} | {'MaxDD':>7} | {'Turnover':>8} | {'IC Mean':>8} | {'IC Std':>7} | {'Top10 Mean':>10} | {'Top10 Med':>9} | {'Top10 Win':>9}")
+        print("-" * 140)
+        
+        for _, row in yearly_summary.iterrows():
+            year = int(row['year'])
+            start_val = row['start_value']
+            end_val = row['end_value']
+            ret = row['return']
+            max_dd = row['max_drawdown']
+            turnover = row['turnover']
+            ic_mean = row.get('ic_mean', np.nan)
+            ic_std = row.get('ic_std', np.nan)
+            top10_mean = row.get('top10_mean_ret', np.nan)
+            top10_median = row.get('top10_median_ret', np.nan)
+            top10_win = row.get('top10_pct_positive', np.nan)
+            
+            ic_mean_str = f"{ic_mean:>8.4f}" if not pd.isna(ic_mean) else "     N/A"
+            ic_std_str = f"{ic_std:>7.4f}" if not pd.isna(ic_std) else "    N/A"
+            top10_mean_str = f"{top10_mean:>9.2%}" if not pd.isna(top10_mean) else "      N/A"
+            top10_median_str = f"{top10_median:>8.2%}" if not pd.isna(top10_median) else "     N/A"
+            top10_win_str = f"{top10_win:>8.2%}" if not pd.isna(top10_win) else "     N/A"
+            
+            print(f"{year:>6} | {start_val:>10,.0f} | {end_val:>10,.0f} | {ret:>7.2%} | {max_dd:>6.2%} | {turnover:>7.2%} | {ic_mean_str} | {ic_std_str} | {top10_mean_str} | {top10_median_str} | {top10_win_str}")
+        
+        print("=" * 140)
     
     results.to_csv('backtest_results.csv', index=False)
     trades.to_csv('backtest_trades.csv', index=False)
     if not turnover_data.empty:
         turnover_data.to_csv('backtest_turnover.csv', index=False)
+    if not yearly_summary.empty:
+        yearly_summary.to_csv('backtest_yearly_summary.csv', index=False)
+        print("Saved yearly summary to backtest_yearly_summary.csv")
     
     # Calculate and save monthly summary
     monthly_summary = calculate_monthly_summary(results, turnover_data)
