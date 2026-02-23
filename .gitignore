@@ -12,3 +12,4 @@ wheels/
 models_lgbm/
 data/
 *.csv
+*.png

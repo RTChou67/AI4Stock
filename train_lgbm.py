@@ -1,26 +1,34 @@
 #!/usr/bin/env python3
 """
-LightGBM 量化模型 - 训练脚本 (并行版)
+LightGBM 量化模型 - 训练脚本 (库自带并行版)
 - 月度滚动训练 (Monthly Rolling)
-- 正确的横截面 Rank
+- 正确的横截面 Rank (pandarallel 并行)
 - 无 lookahead 风险
-- 多进程并行训练 (ProcessPoolExecutor)
+- LightGBM 内置多线程训练
 """
 
 import os
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from tqdm import tqdm
 import joblib
-import gc
+from joblib import Parallel, delayed
+
+# 尝试导入 pandarallel，如果没有则使用备选方案
+try:
+    from pandarallel import pandarallel
+    HAS_PANDARALLEL = True
+except ImportError:
+    HAS_PANDARALLEL = False
+    print("Warning: pandarallel not found. Install with: pip install pandarallel")
+    print("Will use alternative parallel method for ranking.")
 
 DATA_DIR = "data/daily"
 MODEL_DIR = "models_lgbm"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-N_JOBS = 16  # 并行训练进程数
+N_JOBS = 16  # 总核心数
 
 # 股票筛选条件
 MIN_PRICE = 2.0
@@ -154,16 +162,15 @@ def process_one_file(filepath):
 
 
 def load_all_data(files):
-    """加载所有股票数据，合并成一个大表"""
-    dfs = []
+    """加载所有股票数据，合并成一个大表 (使用 joblib.Parallel)"""
+    print("Loading data using joblib.Parallel...")
     
-    # 数据加载本身也可以并行，但这里先复用之前的逻辑
-    with ProcessPoolExecutor(max_workers=N_JOBS) as executor:
-        futures = {executor.submit(process_one_file, f): f for f in files}
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Loading"):
-            df = future.result()
-            if df is not None:
-                dfs.append(df)
+    # joblib.Parallel 比 ProcessPoolExecutor 更高效
+    results = Parallel(n_jobs=N_JOBS, backend='loky', verbose=1)(
+        delayed(process_one_file)(f) for f in files
+    )
+    
+    dfs = [r for r in results if r is not None]
     
     if len(dfs) == 0:
         return None
@@ -176,19 +183,39 @@ def load_all_data(files):
 
 def add_cross_sectional_rank(all_data):
     """
-    添加横截面排名特征
+    添加横截面排名特征 (使用库自带并行)
     关键：在所有股票之间做rank，不是单只股票
     """
-    print("Adding cross-sectional rank features...")
+    rank_features = [f'{c}_rank' for c in BASE_FEATURES]
     
-    rank_features = []
-    for col in tqdm(BASE_FEATURES, desc="Ranking"):
-        rank_col = f'{col}_rank'
-        # 按日期分组，每天内部做rank（这才是真正的横截面rank！）
-        all_data[rank_col] = all_data.groupby('date')[col].transform(
-            lambda x: x.rank(pct=True, method='average')
+    if HAS_PANDARALLEL:
+        # 方案 1: 使用 pandarallel (推荐，最快)
+        print("Adding cross-sectional rank features (pandarallel)...")
+        pandarallel.initialize(nb_workers=N_JOBS, progress_bar=True, verbose=0)
+        
+        for col in BASE_FEATURES:
+            rank_col = f'{col}_rank'
+            all_data[rank_col] = all_data.groupby('date')[col].parallel_apply(
+                lambda x: x.rank(pct=True, method='average')
+            )
+    else:
+        # 方案 2: 使用 joblib.Parallel 并行处理各特征
+        print("Adding cross-sectional rank features (joblib.Parallel)...")
+        
+        def compute_rank_for_feature(col):
+            """计算单个特征的 rank"""
+            return all_data.groupby('date')[col].transform(
+                lambda x: x.rank(pct=True, method='average')
+            )
+        
+        # 并行计算所有特征的 rank
+        results = Parallel(n_jobs=N_JOBS, backend='threading')(
+            delayed(compute_rank_for_feature)(col) for col in BASE_FEATURES
         )
-        rank_features.append(rank_col)
+        
+        # 将结果赋值回 DataFrame
+        for col, rank_series in zip(BASE_FEATURES, results):
+            all_data[f'{col}_rank'] = rank_series
     
     return all_data, rank_features
 
@@ -204,11 +231,10 @@ def prepare_regression_data(all_data, rank_features, label_col='future_ret_5'):
     return X, y
 
 
-def train_month_and_save(args):
+def train_month_and_save(year, month, all_data, rank_features):
     """
-    训练并保存单月模型 (Wrapper for parallel execution)
+    训练并保存单月模型 (使用 LightGBM 内置多线程)
     """
-    year, month, all_data, rank_features = args
     model_path = os.path.join(MODEL_DIR, f"lgbm_{year}{month:02d}.pkl")
     
     # 如果模型已存在，可以选择跳过
@@ -244,7 +270,7 @@ def train_month_and_save(args):
     train_set = lgb.Dataset(X_train, label=y_train)
     valid_set = lgb.Dataset(X_valid, label=y_valid, reference=train_set)
     
-    # 训练参数
+    # 训练参数 - 使用 LightGBM 内置多线程
     params = {
         'objective': 'regression_l1',
         'metric': 'rmse',
@@ -255,8 +281,8 @@ def train_month_and_save(args):
         'bagging_fraction': 0.8,
         'bagging_freq': 5,
         'verbose': -1,
-        'n_jobs': 1, # 并行训练时，单模型单线程，避免CPU过载
-        'num_threads': 1
+        'n_jobs': N_JOBS,           # 使用全部 16 核
+        'num_threads': N_JOBS       # LightGBM 多线程训练
     }
     
     # 训练
@@ -286,7 +312,7 @@ def train_month_and_save(args):
 
 def main():
     print("=" * 60)
-    print("LightGBM Regression - Monthly Rolling Training (Parallel)")
+    print("LightGBM Regression - Monthly Rolling Training (Library Parallel)")
     print("=" * 60)
     
     # 获取所有文件
@@ -308,8 +334,8 @@ def main():
     print("\nStep 2: Adding cross-sectional rank features...")
     all_data, rank_features = add_cross_sectional_rank(all_data)
     
-    # Step 3: 月度训练 (并行)
-    print("\nStep 3: Training monthly models (Parallel)...")
+    # Step 3: 月度训练 (串行，但 LightGBM 内部使用多线程)
+    print("\nStep 3: Training monthly models (LightGBM multi-threading)...")
     
     start_date = pd.Timestamp("2003-01-01")
     end_date = pd.Timestamp("2025-12-01")
@@ -318,23 +344,20 @@ def main():
     tasks = []
     
     while current_date <= end_date:
-        tasks.append((current_date.year, current_date.month, all_data, rank_features))
+        tasks.append((current_date.year, current_date.month))
         current_date += pd.DateOffset(months=1)
         
     print(f"Total months to train: {len(tasks)}")
-    print(f"Parallel jobs: {N_JOBS}")
+    print(f"LightGBM threads per model: {N_JOBS}")
+    print("Note: Training months sequentially, but each month uses 16 threads")
     
-    # 使用 ProcessPoolExecutor 并行训练
-    # 注意：all_data 会通过 fork (Linux) 共享内存，不会有巨大的 pickle 开销
-    with ProcessPoolExecutor(max_workers=N_JOBS) as executor:
-        futures = [executor.submit(train_month_and_save, task) for task in tasks]
-        
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Training"):
-            try:
-                res = future.result()
-                # print(res) # 可选：打印每个任务的结果
-            except Exception as e:
-                print(f"Task failed: {e}")
+    # 串行训练每个月，但 LightGBM 内部使用多线程
+    for year, month in tqdm(tasks, desc="Training"):
+        try:
+            res = train_month_and_save(year, month, all_data, rank_features)
+            # tqdm 会自动显示进度，不需要打印每个结果
+        except Exception as e:
+            print(f"Task {year}-{month:02d} failed: {e}")
     
     print("\nAll monthly models trained!")
 
