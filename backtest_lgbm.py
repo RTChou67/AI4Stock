@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-LightGBM 回测脚本 (并行信号生成版)
-包含以下特性：
-1. 月度滚动模型 (Monthly Rolling) - 并行预测
-2. T+1 交易执行 (T日使用T-1信号)
-3. 换手率控制 (Buffer逻辑: Keep Top 30, Target Top 20)
-4. 真实交易限制 (停牌无法交易，估值使用最近价格)
-5. 仓位控制 (单股最大权重 5%)
-6. 费率控制 (万五佣金，最低5元)
-7. 流动性与涨跌停限制 (Limit Up/Down, Max Amount Ratio)
-8. IC 分析 (Rank IC, IR, Decay)
+LightGBM 回测脚本 (Advanced Analysis Edition)
+配置：过去1年数据，预测20天收益，10天调仓
+特性：
+1. 每年年初重置资金
+2. 收益集中度分析 (Top-k Contribution)
+3. 月度 IC/ICIR 时序分析
+4. 特征分布漂移检测 (KS Test)
 """
 
 import os
@@ -19,91 +16,42 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import warnings
+from scipy import stats  # 用于 KS Test
 
-# ============ 配置 ============
+warnings.filterwarnings('ignore')
+
 DAILY_DIR = "data/daily"
 MODEL_DIR = "models_lgbm"
 
-# 时间范围 (对应 Monthly Training)
-START_YEAR = 2003
-END_YEAR = 2025
+TOP_N = 20
+KEEP_TOP_N = 30
+REBALANCE_DAYS = 10  # 持仓10天
 
-# 选股参数
-TOP_N = 10           # 目标持仓数量
-KEEP_TOP_N = 30      # 缓冲期：排名跌出30才卖出（降低换手）
-REBALANCE_DAYS = 5   # 调仓频率 (交易日)，与训练标签 future_ret_5 匹配
-
-# 资金与风控
 INITIAL_CASH = 1_000_000
-COMMISSION = 0.0005  # 单边万五
-MIN_COMMISSION = 5   # 最低五元
-MAX_WEIGHT = 0.05    # 单只股票最大权重 5%
-MAX_AMOUNT_RATIO = 0.02 # 最大成交额占比 (2% of daily volume)
+COMMISSION = 0.00002
+MIN_COMMISSION = 5
+MAX_WEIGHT = 0.05
+MAX_AMOUNT_RATIO = 0.02
 
-N_JOBS = 16 # 并行预测进程数
-
-# 基础特征 (必须与训练时一致)
 BASE_FEATURES = [
     'ret_1', 'ret_5', 'ret_10', 'ret_20', 'ret_40', 'ret_60',
     'ma5_ratio', 'ma10_ratio', 'ma20_ratio',
     'volatility_5', 'volatility_10', 'volatility_20',
     'inv_volatility_5', 'inv_volatility_10', 'inv_volatility_20',
-    'vol_ratio', 'vol_ratio_20',
-    'new_high_ratio',
+    'vol_ratio', 'vol_ratio_20', 'new_high_ratio',
 ]
 
-# 股票筛选条件
-MIN_PRICE = 2.0
-MAX_PRICE = 1000.0
-MIN_AVG_VOLUME = 1000000
-MIN_LISTING_DAYS = 60
-
-
-def filter_stock(df):
-    """筛选股票"""
-    if len(df) < MIN_LISTING_DAYS:
-        return False
-    
-    required_cols = ['close', 'volume']
-    if not all(col in df.columns for col in required_cols):
-        return False
-    
-    if df['close'].isna().all() or df['volume'].isna().all():
-        return False
-    
-    recent = df.tail(20).copy()
-    recent = recent[recent['close'] > 0]
-    if len(recent) < 10:
-        return False
-    
-    avg_price = recent['close'].mean()
-    if avg_price < MIN_PRICE or avg_price > MAX_PRICE:
-        return False
-    
-    avg_volume = recent['volume'].mean()
-    if pd.isna(avg_volume) or avg_volume < MIN_AVG_VOLUME:
-        return False
-    
-    zero_volume_days = (recent['volume'] == 0).sum()
-    if zero_volume_days > 5:
-        return False
-    
-    return True
+# 选几个代表性特征做漂移检测，避免输出太多
+DRIFT_CHECK_FEATURES = ['ret_20', 'volatility_20', 'ma20_ratio', 'new_high_ratio', 'vol_ratio']
 
 
 def compute_features(df):
-    """计算原始特征"""
     df = df.copy()
-    
-    # 价格过滤
     df = df[df['close'] > 0]
     df = df[df['volume'] > 0]
     
-    # 保留原始涨跌幅用于回测限制 (未裁剪)
     df['raw_pct_change'] = df['close'].pct_change(1)
-    
-    # 收益率 - 带裁剪 (用于模型特征)
     df['ret_1'] = df['raw_pct_change'].clip(-0.2, 0.2)
     df['ret_5'] = df['close'].pct_change(5).clip(-0.5, 0.5)
     df['ret_10'] = df['close'].pct_change(10)
@@ -111,870 +59,564 @@ def compute_features(df):
     df['ret_40'] = df['close'].pct_change(40)
     df['ret_60'] = df['close'].pct_change(60)
     
-    # 均线比率 - 带裁剪
     df['ma5'] = df['close'].rolling(5).mean()
     df['ma10'] = df['close'].rolling(10).mean()
     df['ma20'] = df['close'].rolling(20).mean()
-    
     df['ma5_ratio'] = (df['close'] / df['ma5']).clip(0.5, 2)
     df['ma10_ratio'] = (df['close'] / df['ma10']).clip(0.5, 2)
     df['ma20_ratio'] = (df['close'] / df['ma20']).clip(0.5, 2)
     
-    # 波动率 - 增加稳健性 (避免除零)
     df['volatility_5'] = df['ret_1'].rolling(5).std().clip(lower=1e-4)
     df['volatility_10'] = df['ret_1'].rolling(10).std().clip(lower=1e-4)
     df['volatility_20'] = df['ret_1'].rolling(20).std().clip(lower=1e-4)
-    
     df['inv_volatility_5'] = 1 / df['volatility_5']
     df['inv_volatility_10'] = 1 / df['volatility_10']
     df['inv_volatility_20'] = 1 / df['volatility_20']
     
-    # 成交量
     df['vol_ma5'] = df['volume'].rolling(5).mean()
     df['vol_ma20'] = df['volume'].rolling(20).mean()
     df['vol_ratio'] = df['volume'] / df['vol_ma5']
     df['vol_ratio_20'] = df['volume'] / df['vol_ma20']
     
-    # 250日新高 - 带裁剪
     df['high_250'] = df['close'].rolling(250).max()
     df['new_high_ratio'] = (df['close'] / df['high_250']).clip(0, 2)
     
-    # 计算未来收益（用于计算 IC）
-    df['future_ret_5'] = df['close'].shift(-5) / df['close'] - 1
+    df['future_ret_20'] = df['close'].shift(-20) / df['close'] - 1
     
     return df
 
 
-def _load_one(f):
-    try:
-        symbol = os.path.splitext(os.path.basename(f))[0]
-        df = pd.read_parquet(f)
-        if len(df) < 100: return None
-        if not filter_stock(df): return None
-        
-        df = compute_features(df)
-        df['date'] = pd.to_datetime(df['date'])
-        df['symbol'] = symbol
-        
-        # 基础列
-        cols = ['date', 'symbol'] + BASE_FEATURES + ['close', 'amount', 'raw_pct_change', 'future_ret_5']
-        df = df[cols].dropna()
-        return df if len(df) > 0 else None
-    except:
-        return None
-
-
 def load_and_merge_all_data():
-    """
-    加载所有股票数据
-    """
     files = glob.glob(os.path.join(DAILY_DIR, "*.parquet"))
-    
     all_data = []
-    valid_symbols = []
     
-    # 使用 ProcessPoolExecutor 并行加载以加速
-    print(f"Loading {len(files)} files (Parallel)...")
+    print(f"Loading {len(files)} files...")
+    for f in tqdm(files, desc="Loading"):
+        try:
+            symbol = os.path.splitext(os.path.basename(f))[0]
+            df = pd.read_parquet(f)
+            if len(df) < 100:
+                continue
+            df = compute_features(df)
+            df['date'] = pd.to_datetime(df['date'])
+            df['symbol'] = symbol
+            cols = ['date', 'symbol'] + BASE_FEATURES + ['close', 'amount', 'raw_pct_change', 'future_ret_20']
+            df = df[cols].dropna(subset=BASE_FEATURES)
+            if len(df) > 0:
+                all_data.append(df)
+        except:
+            continue
     
-    with ProcessPoolExecutor(max_workers=N_JOBS) as executor:
-        futures = {executor.submit(_load_one, f): f for f in files}
-        for future in tqdm(as_completed(futures), total=len(files), desc="Loading"):
-            res = future.result()
-            if res is not None:
-                all_data.append(res)
-                valid_symbols.append(res['symbol'].iloc[0])
-
-    # 合并所有数据
-    print("Merging data...")
     if not all_data:
         return pd.DataFrame(), []
-        
+    
     merged = pd.concat(all_data, ignore_index=True)
     merged = merged.sort_values(['date', 'symbol'])
-    
-    print(f"Total records: {len(merged)}")
-    print(f"Valid symbols: {len(valid_symbols)}")
-    print(f"Date range: {merged['date'].min()} to {merged['date'].max()}")
-    
-    return merged, valid_symbols
+    print(f"Records: {len(merged)}")
+    return merged, merged['symbol'].unique().tolist()
 
 
-def process_month_signal(args):
+# ==== 新增分析模块 ====
+
+def analyze_feature_drift(all_data):
     """
-    处理单月预测任务
+    检查特征分布漂移 (KS Test)
+    对比 每年数据 vs 全样本数据
     """
-    year, month, month_data = args
-    model_path = os.path.join(MODEL_DIR, f"lgbm_{year}{month:02d}.pkl")
+    print("\n" + "=" * 60)
+    print("FEATURE DRIFT ANALYSIS (KS Test)")
+    print("Compare each year's distribution vs Global distribution")
+    print("P-value < 0.01 implies significant drift")
+    print("=" * 60)
     
-    if not os.path.exists(model_path):
-        return None
+    all_data['year'] = all_data['date'].dt.year
+    years = sorted(all_data['year'].unique())
     
-    try:
-        model_data = joblib.load(model_path)
-        model = model_data['model']
-        feature_cols = model_data['features']
+    # 打印表头
+    header = f"{'Year':<6} | {'Feature':<15} | {'KS Stat':>8} | {'P-Value':>10} | {'Drift?'}"
+    print(header)
+    print("-" * len(header))
+    
+    for year in years:
+        year_data = all_data[all_data['year'] == year]
+        if len(year_data) < 100: continue
         
-        # 必须设为1线程，避免并行进程中的线程争抢
-        # LightGBM 的 model 对象可能保留了原来的参数，但预测通常单线程很快
-        
-        predictions = []
-        dates = sorted(month_data['date'].unique())
-        
-        for date in dates:
-            day_data = month_data[month_data['date'] == date].copy()
-            if len(day_data) < 10: continue
+        drift_count = 0
+        for feat in DRIFT_CHECK_FEATURES:
+            if feat not in all_data.columns: continue
             
-            # 横截面 Rank
-            for col in BASE_FEATURES:
-                day_data[f'{col}_rank'] = day_data[col].rank(pct=True, method='average')
+            # KS Test
+            # Null hypothesis: two samples are drawn from the same distribution
+            stat, pval = stats.ks_2samp(year_data[feat], all_data[feat])
             
-            # 预测
-            X = day_data[[c for c in feature_cols if c in day_data.columns]]
-            if len(X) > 0:
-                day_data['pred_ret'] = model.predict(X, num_threads=1)
-                predictions.append(day_data[['date', 'symbol', 'pred_ret', 'close', 'future_ret_5']])
+            is_drift = "YES !!!" if pval < 0.01 else "No"
+            if pval < 0.01: drift_count += 1
+            
+            print(f"{year:<6} | {feat:<15} | {stat:>8.4f} | {pval:>10.4f} | {is_drift}")
         
-        if predictions:
-            return pd.concat(predictions, ignore_index=True)
-        return None
+        if drift_count > 0:
+            print(f"    >> Year {year} has {drift_count} drifting features.")
+        print("-" * len(header))
+
+
+def analyze_concentration(yearly_stock_pnl):
+    """
+    分析收益集中度：Top 10 股票贡献占比
+    """
+    print("\n" + "=" * 80)
+    print("PnL CONCENTRATION ANALYSIS")
+    print("Check if returns are driven by a few lucky stocks (High % is risky)")
+    print("=" * 80)
+    
+    print(f"{'Year':<6} | {'Total PnL':>12} | {'Top10 PnL':>12} | {'Top10 %':>8} | {'Top1 PnL':>12} | {'Top1 %':>8}")
+    print("-" * 80)
+    
+    for year, pnl_map in sorted(yearly_stock_pnl.items()):
+        if not pnl_map: continue
         
-    except Exception as e:
-        # print(f"Error in {year}-{month}: {e}")
-        return None
+        series = pd.Series(pnl_map)
+        total_pnl = series.sum()
+        
+        # 按绝对值排序？不，通常看赚钱的票。看 Net PnL 排序。
+        sorted_pnl = series.sort_values(ascending=False)
+        
+        top10_sum = sorted_pnl.head(10).sum()
+        top1_sum = sorted_pnl.head(1).sum() if len(sorted_pnl) > 0 else 0
+        
+        # 计算占比。如果总 PnL 是负的，占比解释起来比较奇怪，但数值上仍有意义
+        # 若 total_pnl 接近 0，避免除零
+        if abs(total_pnl) < 1:
+            ratio10 = 0
+            ratio1 = 0
+        else:
+            ratio10 = top10_sum / total_pnl
+            ratio1 = top1_sum / total_pnl
+            
+        print(f"{year:<6} | {total_pnl:>12.0f} | {top10_sum:>12.0f} | {ratio10:>8.2%} | {top1_sum:>12.0f} | {ratio1:>8.2%}")
+
+    print("=" * 80)
+
+
+def analyze_monthly_ic_plot(predictions):
+    """
+    绘制月度 IC 和 ICIR 图
+    """
+    print("Analyzing Monthly IC...")
+    valid_preds = predictions.dropna(subset=['future_ret_20'])
+    if len(valid_preds) == 0: return
+
+    # 计算日频 IC
+    daily_ic = valid_preds.groupby('date').apply(
+        lambda x: x['pred_ret'].corr(x['future_ret_20'], method='spearman')
+    )
+    
+    # 重采样为月频
+    monthly_ic_mean = daily_ic.resample('ME').mean()
+    monthly_ic_std = daily_ic.resample('ME').std()
+    monthly_icir = monthly_ic_mean / monthly_ic_std
+    
+    # 绘图
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+    
+    # 图1：月度 IC 均值
+    color = ['red' if v < 0 else 'blue' for v in monthly_ic_mean.values]
+    ax1.bar(monthly_ic_mean.index, monthly_ic_mean.values, color=color, alpha=0.7)
+    ax1.axhline(0, color='black', linestyle='-', linewidth=0.5)
+    ax1.set_title("Monthly Mean IC (Spearman)")
+    ax1.set_ylabel("IC")
+    ax1.grid(True, alpha=0.3)
+    
+    # 图2：月度 ICIR
+    ax2.plot(monthly_icir.index, monthly_icir.values, marker='o', linestyle='-', color='green')
+    ax2.axhline(0, color='black', linestyle='-', linewidth=0.5)
+    ax2.set_title("Monthly ICIR (Mean IC / Std IC)")
+    ax2.set_ylabel("ICIR")
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('backtest_ic_monthly.png', dpi=150)
+    print("Saved backtest_ic_monthly.png")
+    
+    # 打印数据
+    print("\n[Monthly IC Summary]")
+    summary = pd.DataFrame({
+        'IC Mean': monthly_ic_mean,
+        'ICIR': monthly_icir
+    })
+    # 过滤掉NaN (某些月份可能没数据)
+    summary = summary.dropna()
+    print(summary.tail(12)) # 打印最后12个月
+
+
+# ==========================
 
 
 def generate_signals(all_data):
-    """
-    生成预测信号 (并行版)
-    """
-    all_data['year_month'] = all_data['date'].dt.to_period('M')
-    unique_yms = sorted(all_data['year_month'].unique())
+    all_dates = sorted(all_data['date'].unique())
+    model_files = glob.glob(os.path.join(MODEL_DIR, "lgbm_*.pkl"))
+    model_dates = []
+    for mf in model_files:
+        try:
+            basename = os.path.basename(mf)
+            date_str = basename.replace('lgbm_', '').replace('.pkl', '')
+            m_date = pd.to_datetime(date_str, format='%Y%m%d')
+            model_dates.append({'date': m_date, 'path': mf})
+        except:
+            continue
     
-    tasks = []
-    for ym in unique_yms:
-        year = ym.year
-        month = ym.month
-        if year < START_YEAR: continue
-        
-        # 提取当月数据 (Subset)
-        month_mask = (all_data['date'].dt.year == year) & (all_data['date'].dt.month == month)
-        month_data = all_data[month_mask].copy()
-        
-        if len(month_data) > 0:
-            tasks.append((year, month, month_data))
-            
-    print(f"Generating signals for {len(tasks)} months with {N_JOBS} workers...")
-    
-    all_predictions = []
-    with ProcessPoolExecutor(max_workers=N_JOBS) as executor:
-        futures = [executor.submit(process_month_signal, t) for t in tasks]
-        
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Predicting"):
-            res = future.result()
-            if res is not None:
-                all_predictions.append(res)
-    
-    if not all_predictions:
-        print("No predictions generated!")
-        return pd.DataFrame()
+    model_info_df = pd.DataFrame(model_dates).sort_values('date').reset_index(drop=True)
+    if model_info_df.empty: return pd.DataFrame()
 
-    predictions = pd.concat(all_predictions, ignore_index=True)
-    predictions = predictions.sort_values(['date', 'pred_ret'], ascending=[True, False])
+    all_predictions = []
+    current_model = None
+    current_model_path = None
+    current_features = None
     
-    return predictions
+    start_date = model_info_df['date'].min()
+    predict_dates = [d for d in all_dates if d >= start_date]
+    
+    for date in tqdm(predict_dates, desc="Generating Signals"):
+        valid_models = model_info_df[model_info_df['date'] < date]
+        if valid_models.empty: continue
+            
+        latest_model_row = valid_models.iloc[-1]
+        model_path = latest_model_row['path']
+        
+        if model_path != current_model_path:
+            try:
+                m_data = joblib.load(model_path)
+                current_model = m_data['model']
+                current_features = m_data['features']
+                current_model_path = model_path
+            except:
+                continue
+        
+        if current_model is None: continue
+
+        day_data = all_data[all_data['date'] == date].copy()
+        if len(day_data) < 10: continue
+            
+        for col in BASE_FEATURES:
+            day_data[f'{col}_rank'] = day_data[col].rank(pct=True, method='average')
+            
+        valid_cols = [c for c in current_features if c in day_data.columns]
+        if len(valid_cols) != len(current_features): continue
+            
+        X = day_data[current_features]
+        if len(X) > 0:
+            day_data['pred_ret'] = current_model.predict(X, num_threads=1)
+            all_predictions.append(day_data[['date', 'symbol', 'pred_ret', 'close', 'future_ret_20']])
+
+    if not all_predictions: return pd.DataFrame()
+    return pd.concat(all_predictions, ignore_index=True).sort_values(['date', 'pred_ret'], ascending=[True, False])
 
 
 def build_data_matrices(all_data, valid_symbols):
-    """构建数据矩阵（高效查询）"""
-    print("Building data matrices...")
-    
     price_df = all_data.pivot(index='date', columns='symbol', values='close').sort_index()
     amount_df = all_data.pivot(index='date', columns='symbol', values='amount').sort_index()
     pct_change_df = all_data.pivot(index='date', columns='symbol', values='raw_pct_change').sort_index()
-    
-    pre_close_df = price_df.shift(1)
-    
-    return price_df, pre_close_df, amount_df, pct_change_df
+    return price_df, price_df.shift(1), amount_df, pct_change_df
 
 
-def analyze_ic(predictions):
-    """
-    计算 IC 和 ICIR
-    """
-    if predictions.empty:
-        return None
+def calculate_yearly_ic_and_top10(predictions, year):
+    year_data = predictions[predictions['date'].dt.year == year]
+    if len(year_data) == 0:
+        return {'ic_mean': np.nan, 'ic_std': np.nan, 'top10_mean_ret': np.nan}
+    
+    valid_data = year_data.dropna(subset=['future_ret_20'])
+    if len(valid_data) == 0: return {'ic_mean': np.nan} 
 
-    print("Calculating IC metrics...")
-    ic_series = predictions.groupby('date').apply(
-        lambda x: x['pred_ret'].corr(x['future_ret_5'], method='spearman')
-    )
+    daily_ic = valid_data.groupby('date').apply(
+        lambda x: x['pred_ret'].corr(x['future_ret_20'], method='spearman')
+    ).dropna()
     
-    ic_series = ic_series.dropna()
-    if len(ic_series) == 0: return None
-
-    rolling_ic_20 = ic_series.rolling(20).mean()
-    rolling_ic_60 = ic_series.rolling(60).mean()
-    cumulative_ic = ic_series.cumsum()
+    daily_top_returns = []
+    for date, day_data in valid_data.groupby('date'):
+        if len(day_data) >= 10:
+            top_stocks = day_data.nlargest(10, 'pred_ret')
+            avg_ret = top_stocks['future_ret_20'].mean()
+            daily_top_returns.append(avg_ret)
     
-    mean_ic = ic_series.mean()
-    ic_std = ic_series.std()
-    icir = mean_ic / ic_std if ic_std != 0 else 0
-    positive_ratio = (ic_series > 0).mean()
+    ic_mean = daily_ic.mean() if len(daily_ic) > 0 else np.nan
+    ic_std = daily_ic.std() if len(daily_ic) > 0 else np.nan
+    top10_mean_ret = pd.Series(daily_top_returns).mean() if daily_top_returns else np.nan
     
-    print("\n" + "=" * 60)
-    print("IC ANALYSIS")
-    print("=" * 60)
-    print(f"Mean IC:          {mean_ic:.4f}")
-    print(f"IC Std:           {ic_std:.4f}")
-    print(f"ICIR:             {icir:.4f}")
-    print(f"Positive IC Ratio:{positive_ratio:.2%}")
-    print("=" * 60)
-    
-    return ic_series, rolling_ic_20, rolling_ic_60, cumulative_ic
+    return {'ic_mean': ic_mean, 'ic_std': ic_std, 'top10_mean_ret': top10_mean_ret}
 
 
-def calculate_yearly_ic_and_top10_stats(predictions, top_n=10):
-    """
-    按年计算IC统计和Top N收益分布
-    
-    输出: year, ic_mean, ic_std, top10_mean_ret, top10_median_ret, top10_pct_positive
-    """
-    if predictions.empty:
-        return pd.DataFrame()
-    
-    print("Calculating yearly IC and Top10 return stats...")
-    
-    predictions = predictions.copy()
-    predictions['date'] = pd.to_datetime(predictions['date'])
-    predictions['year'] = predictions['date'].dt.year
-    
-    results = []
-    
-    for year, year_data in predictions.groupby('year'):
-        # 1. 计算每日IC
-        daily_ic = year_data.groupby('date').apply(
-            lambda x: x['pred_ret'].corr(x['future_ret_5'], method='spearman')
-        ).dropna()
-        
-        ic_mean = daily_ic.mean() if len(daily_ic) > 0 else np.nan
-        ic_std = daily_ic.std() if len(daily_ic) > 0 else np.nan
-        
-        # 2. 计算每日Top N收益
-        daily_top_returns = []
-        for date, day_data in year_data.groupby('date'):
-            if len(day_data) >= top_n:
-                top_stocks = day_data.nlargest(top_n, 'pred_ret')
-                # 计算等权平均收益
-                avg_ret = top_stocks['future_ret_5'].mean()
-                daily_top_returns.append(avg_ret)
-        
-        if len(daily_top_returns) > 0:
-            top_returns = pd.Series(daily_top_returns)
-            top10_mean_ret = top_returns.mean()
-            top10_median_ret = top_returns.median()
-            top10_pct_positive = (top_returns > 0).mean()
-        else:
-            top10_mean_ret = np.nan
-            top10_median_ret = np.nan
-            top10_pct_positive = np.nan
-        
-        results.append({
-            'year': year,
-            'ic_mean': ic_mean,
-            'ic_std': ic_std,
-            'top10_mean_ret': top10_mean_ret,
-            'top10_median_ret': top10_median_ret,
-            'top10_pct_positive': top10_pct_positive,
-            'n_days_ic': len(daily_ic),
-            'n_days_top10': len(daily_top_returns)
-        })
-    
-    return pd.DataFrame(results).sort_values('year')
-
-
-def backtest(signals, price_df, pre_close_df, amount_df, pct_change_df, predictions=None):
-    """
-    执行回测 (串行，每年初重置)
-    如果提供 predictions，会计算每年的 IC 和 Top10 统计并合并到 yearly_summary
-    """
+def backtest(signals, predictions, price_df, pre_close_df, amount_df, pct_change_df):
     if signals.empty:
-        print("No signals to backtest!")
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
+        print("No signals!")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
+    
     signals_by_date = signals.set_index('date')
     all_dates = sorted(price_df.index)
     start_date = signals['date'].min()
     end_date = signals['date'].max()
     
     trading_days = [d for d in all_dates if d >= start_date and d <= end_date]
-    rebalance_dates = trading_days[::REBALANCE_DAYS]
-    rebalance_set = set(rebalance_dates)
-    
-    print(f"Rebalance dates: {len(rebalance_dates)} (every {REBALANCE_DAYS} trading days)")
-    print(f"Annual Reset: ENABLED (Reset to {INITIAL_CASH:,.0f} at start of each year)")
+    rebalance_indices = list(range(0, len(trading_days), REBALANCE_DAYS))
+    rebalance_set = set([trading_days[i] for i in rebalance_indices])
     
     cash = INITIAL_CASH
-    holdings = {}
+    yearly_stock_pnl = {}
+    current_stock_pnl = {}
+    
+    holdings = {} # {symbol: shares}
+    holding_costs = {} # {symbol: average_cost}
+    
     portfolio_values = []
     trades = []
     last_known_prices = {}
     turnover_data = []
-    yearly_returns = []  # 记录每年收益 
+    yearly_returns = []
     
-    current_year_start_value = INITIAL_CASH  # 记录当年初始资金
-    current_year_max_value = INITIAL_CASH     # 记录当年最高市值（用于计算回撤）
-    current_year_turnover = 0.0               # 记录当年累计换手率
-    
-    # 预计算每年的 IC 和 Top10 统计（如果提供了 predictions）
-    yearly_ic_top10_stats = {}
-    if predictions is not None and not predictions.empty:
-        pred_df = predictions.copy()
-        pred_df['date'] = pd.to_datetime(pred_df['date'])
-        pred_df['year'] = pred_df['date'].dt.year
-        
-        for year, year_data in pred_df.groupby('year'):
-            # 每日IC
-            daily_ic = year_data.groupby('date').apply(
-                lambda x: x['pred_ret'].corr(x['future_ret_5'], method='spearman')
-            ).dropna()
-            
-            # 每日Top10收益
-            daily_top_returns = []
-            for date, day_data in year_data.groupby('date'):
-                if len(day_data) >= 10:
-                    top_stocks = day_data.nlargest(10, 'pred_ret')
-                    avg_ret = top_stocks['future_ret_5'].mean()
-                    daily_top_returns.append(avg_ret)
-            
-            if len(daily_top_returns) > 0:
-                top_returns = pd.Series(daily_top_returns)
-                yearly_ic_top10_stats[year] = {
-                    'ic_mean': daily_ic.mean() if len(daily_ic) > 0 else np.nan,
-                    'ic_std': daily_ic.std() if len(daily_ic) > 0 else np.nan,
-                    'top10_mean_ret': top_returns.mean(),
-                    'top10_median_ret': top_returns.median(),
-                    'top10_pct_positive': (top_returns > 0).mean()
-                }
+    current_year_start_value = INITIAL_CASH
+    current_year_max_value = INITIAL_CASH
+    current_year_turnover = 0.0
+    last_processed_date = None
     
     for i, date in enumerate(tqdm(trading_days, desc="Backtesting")):
         date_ts = pd.Timestamp(date)
         
-        # --- Annual Reset Logic: 每年第一个交易日重置 ---
-        if i > 0:
-            prev_date = pd.Timestamp(trading_days[i-1])
-            if date_ts.year != prev_date.year:
-                # 注意：这里使用上一年的最后一天价格（last_known_prices）
-                # 因为上一年最后一个交易日循环结束时已经更新了 last_known_prices
-                year_end_value = cash
-                for sym, shares in holdings.items():
-                    price = last_known_prices.get(sym, 0)
-                    if price > 0:
-                        year_end_value += shares * price
-                
-                year_return = (year_end_value / current_year_start_value) - 1
-                year_max_drawdown = (current_year_max_value - year_end_value) / current_year_max_value if current_year_max_value > 0 else 0
-                
-                year_stats = {
-                    'year': prev_date.year,
-                    'start_value': current_year_start_value,
-                    'end_value': year_end_value,
-                    'return': year_return,
-                    'max_drawdown': year_max_drawdown,
-                    'turnover': current_year_turnover
-                }
-                
-                # 合并 IC 和 Top10 统计
-                if prev_date.year in yearly_ic_top10_stats:
-                    year_stats.update(yearly_ic_top10_stats[prev_date.year])
-                
-                yearly_returns.append(year_stats)
-                
-                print(f"\n[Year {prev_date.year} Summary] Return: {year_return:.2%}, End Value: {year_end_value:,.0f}, MaxDD: {year_max_drawdown:.2%}")
-                
-                # 重置到初始资金（记录 RESET 交易，但实际是账面重置）
-                # 注意：这里不实际卖出，只是账面重置，避免重复计算交易成本
-                # 实际的持仓已经在 year_end_value 中按 last_known_prices 估值了
-                
-                holdings = {}
-                cash = INITIAL_CASH
-                current_year_start_value = INITIAL_CASH
-                current_year_max_value = INITIAL_CASH
-                current_year_turnover = 0.0
-                last_known_prices = {}  # 清空历史价格缓存
-                print(f"[Year {date_ts.year} Start] Reset to INITIAL_CASH: {INITIAL_CASH:,.0f}\n")
+        # 年度重置
+        if last_processed_date is not None and date_ts.year != last_processed_date.year:
+            prev_year = last_processed_date.year
+            year_end_value = cash
+            for sym, shares in holdings.items():
+                price = last_known_prices.get(sym, 0)
+                if price > 0:
+                    val = shares * price
+                    year_end_value += val
+                    cost = holding_costs.get(sym, 0)
+                    pnl = (price - cost) * shares
+                    current_stock_pnl[sym] = current_stock_pnl.get(sym, 0) + pnl
+            
+            yearly_stock_pnl[prev_year] = current_stock_pnl.copy()
+            year_return = (year_end_value / current_year_start_value) - 1
+            year_max_drawdown = (current_year_max_value - year_end_value) / current_year_max_value if current_year_max_value > 0 else 0
+            
+            ic_stats = calculate_yearly_ic_and_top10(predictions, prev_year)
+            yearly_returns.append({
+                'year': prev_year, 'start_value': current_year_start_value, 'end_value': year_end_value,
+                'return': year_return, 'max_drawdown': year_max_drawdown, 'turnover': current_year_turnover,
+                **ic_stats
+            })
+            
+            cash = INITIAL_CASH
+            holdings = {}
+            holding_costs = {}
+            current_stock_pnl = {}
+            current_year_start_value = INITIAL_CASH
+            current_year_max_value = INITIAL_CASH
+            current_year_turnover = 0.0
         
+        # 价格更新
         tradable_prices = {}
         day_amounts = {}
         day_pcts = {}
-        
         if date_ts in price_df.index:
             today_row = price_df.loc[date_ts]
             valid_prices = today_row[today_row.notna() & (today_row > 0)]
-            for sym, price in valid_prices.items():
-                last_known_prices[sym] = price
+            for sym, price in valid_prices.items(): last_known_prices[sym] = price
             tradable_prices = valid_prices.to_dict()
-            
-            if date_ts in amount_df.index:
-                day_amounts = amount_df.loc[date_ts].to_dict()
-            if date_ts in pct_change_df.index:
-                day_pcts = pct_change_df.loc[date_ts].to_dict()
+            if date_ts in amount_df.index: day_amounts = amount_df.loc[date_ts].to_dict()
+            if date_ts in pct_change_df.index: day_pcts = pct_change_df.loc[date_ts].to_dict()
         
+        # 净值计算
         portfolio_value = cash
-        holdings_value = 0
         for sym, shares in holdings.items():
             price = tradable_prices.get(sym, last_known_prices.get(sym, 0))
-            if price > 0:
-                val = shares * price
-                portfolio_value += val
-                holdings_value += val
+            if price > 0: portfolio_value += shares * price
         
-        if date_ts in rebalance_set and i > 0:
-            prev_date = trading_days[i-1]
-            if prev_date in signals_by_date.index:
-                day_signals = signals_by_date.loc[prev_date]
-                if isinstance(day_signals, pd.Series):
-                    day_signals = day_signals.to_frame().T
-                
-                day_signals = day_signals.sort_values('pred_ret', ascending=False)
-                
-                current_symbols = list(holdings.keys())
-                kept_symbols = []
-                ranked_symbols = day_signals['symbol'].tolist()
-                symbol_rank = {sym: r for r, sym in enumerate(ranked_symbols)}
-                
-                for sym in current_symbols:
-                    rank = symbol_rank.get(sym, 9999)
-                    if rank < KEEP_TOP_N:
-                        kept_symbols.append(sym)
-                
-                final_symbols = list(kept_symbols)
-                for sym in ranked_symbols:
-                    if len(final_symbols) >= TOP_N:
-                        break
-                    if sym not in final_symbols:
-                        final_symbols.append(sym)
-                
-                pre_trade_nav = portfolio_value
-                n_stocks = len(final_symbols)
-                if n_stocks > 0:
-                    equal_weight = 1.0 / n_stocks
-                    target_weight = min(equal_weight, MAX_WEIGHT)
-                    if target_weight * n_stocks < 0.95 and n_stocks < TOP_N:
-                         target_weight = 1.0 / n_stocks
-                else:
-                    target_weight = 0
-                
-                buy_val_total = 0
-                sell_val_total = 0
-                
-                # Sell
-                for sym in list(holdings.keys()):
-                    if sym not in final_symbols:
+        if portfolio_value > current_year_max_value: current_year_max_value = portfolio_value
+        
+        # 调仓
+        if date_ts in rebalance_set:
+            prev_trade_idx = i - 1
+            if prev_trade_idx >= 0:
+                prev_date = trading_days[prev_trade_idx]
+                if prev_date in signals_by_date.index:
+                    day_signals = signals_by_date.loc[prev_date]
+                    if isinstance(day_signals, pd.Series): day_signals = day_signals.to_frame().T
+                    day_signals = day_signals.sort_values('pred_ret', ascending=False)
+                    
+                    current_symbols = list(holdings.keys())
+                    ranked_symbols = day_signals['symbol'].tolist()
+                    symbol_rank = {sym: r for r, sym in enumerate(ranked_symbols)}
+                    
+                    kept_symbols = [sym for sym in current_symbols if symbol_rank.get(sym, 9999) < KEEP_TOP_N]
+                    final_symbols = list(kept_symbols)
+                    for sym in ranked_symbols:
+                        if len(final_symbols) >= TOP_N: break
+                        if sym not in final_symbols: final_symbols.append(sym)
+                    
+                    pre_trade_nav = portfolio_value
+                    n_stocks = len(final_symbols)
+                    target_weight = min(1.0 / n_stocks if n_stocks > 0 else 0, MAX_WEIGHT)
+                    
+                    buy_val_total = 0
+                    sell_val_total = 0
+                    
+                    # Sell
+                    for sym in list(holdings.keys()):
+                        if sym not in final_symbols:
+                            if sym not in tradable_prices: continue
+                            if day_pcts.get(sym, 0) < -0.098: continue
+                            
+                            price = tradable_prices[sym]
+                            shares = holdings[sym]
+                            sell_val = shares * price
+                            fee = max(sell_val * COMMISSION, MIN_COMMISSION)
+                            cash += (sell_val - fee)
+                            
+                            cost = holding_costs.get(sym, 0)
+                            pnl = (price - cost) * shares - fee
+                            current_stock_pnl[sym] = current_stock_pnl.get(sym, 0) + pnl
+                            
+                            del holdings[sym]
+                            del holding_costs[sym]
+                            sell_val_total += sell_val
+                            trades.append({'date': date, 'symbol': sym, 'action': 'SELL', 'shares': shares, 'price': price, 'fee': fee, 'pnl': pnl})
+                    
+                    # Buy
+                    target_value_per_stock = portfolio_value * target_weight
+                    for sym in final_symbols:
                         if sym not in tradable_prices: continue
-                        pct = day_pcts.get(sym, 0)
-                        if pct < -0.098: continue
-                        
                         price = tradable_prices[sym]
-                        shares = holdings[sym]
-                        day_amt = day_amounts.get(sym, 0)
-                        max_sell_val = day_amt * MAX_AMOUNT_RATIO if day_amt > 0 else 0
-                        sell_val = shares * price
+                        if price <= 0 or day_pcts.get(sym, 0) > 0.098: continue
                         
-                        if sell_val > max_sell_val and max_sell_val > 0:
-                            shares_to_sell = int(max_sell_val / price / 100) * 100
-                        else:
-                            shares_to_sell = shares
+                        current_shares = holdings.get(sym, 0)
+                        diff_value = target_value_per_stock - (current_shares * price)
+                        if abs(diff_value) < max(target_value_per_stock * 0.1, 2000): continue
                         
-                        if shares_to_sell <= 0: continue
-
-                        amount = shares_to_sell * price
-                        fee = max(amount * COMMISSION, MIN_COMMISSION)
-                        cash += (amount - fee)
-                        holdings[sym] -= shares_to_sell
-                        if holdings[sym] == 0: del holdings[sym]
-                        
-                        sell_val_total += amount
-                        trades.append({'date': date, 'symbol': sym, 'action': 'SELL', 'shares': shares_to_sell, 'price': price, 'fee': fee})
-                
-                # Buy
-                current_total_value = cash
-                for sym in holdings:
-                    price = tradable_prices.get(sym, last_known_prices.get(sym, 0))
-                    current_total_value += holdings[sym] * price
-                
-                target_value_per_stock = current_total_value * target_weight
-                
-                for sym in final_symbols:
-                    if sym not in tradable_prices: continue
-                    price = tradable_prices[sym]
-                    if price <= 0: continue
-                    pct = day_pcts.get(sym, 0)
-                    if pct > 0.098: continue 
-                        
-                    current_shares = holdings.get(sym, 0)
-                    current_stock_value = current_shares * price
-                    diff_value = target_value_per_stock - current_stock_value
+                        if diff_value > 0:
+                            max_buy = cash / (1 + COMMISSION)
+                            buy_val = min(diff_value, max_buy)
+                            day_amt = day_amounts.get(sym, 0)
+                            if day_amt > 0: buy_val = min(buy_val, day_amt * MAX_AMOUNT_RATIO)
+                            
+                            shares_buy = int(buy_val / price / 100) * 100
+                            if shares_buy > 0:
+                                cost = shares_buy * price
+                                fee = max(cost * COMMISSION, MIN_COMMISSION)
+                                if cash >= cost + fee:
+                                    cash -= (cost + fee)
+                                    prev_shares = holdings.get(sym, 0)
+                                    prev_cost = holding_costs.get(sym, 0)
+                                    new_shares = prev_shares + shares_buy
+                                    new_avg_cost = (prev_shares * prev_cost + cost + fee) / new_shares
+                                    holdings[sym] = new_shares
+                                    holding_costs[sym] = new_avg_cost
+                                    buy_val_total += cost
+                                    trades.append({'date': date, 'symbol': sym, 'action': 'BUY', 'shares': shares_buy, 'price': price, 'fee': fee})
                     
-                    if abs(diff_value) < max(target_value_per_stock * 0.1, 2000): continue
-                        
-                    day_amt = day_amounts.get(sym, 0)
-                    max_trade_val = day_amt * MAX_AMOUNT_RATIO if day_amt > 0 else 0
-                    
-                    if diff_value > 0:
-                        available_cash = max(0, cash)
-                        max_buy_value = available_cash / (1 + COMMISSION)
-                        buy_value = min(diff_value, max_buy_value)
-                        if buy_value > max_trade_val and max_trade_val > 0: buy_value = max_trade_val
-                        
-                        shares_to_buy = int(buy_value / price / 100) * 100
-                        if shares_to_buy > 0:
-                            cost = shares_to_buy * price
-                            fee = max(cost * COMMISSION, MIN_COMMISSION)
-                            if cash >= cost + fee:
-                                cash -= (cost + fee)
-                                holdings[sym] = holdings.get(sym, 0) + shares_to_buy
-                                buy_val_total += cost
-                                trades.append({'date': date, 'symbol': sym, 'action': 'BUY', 'shares': shares_to_buy, 'price': price, 'fee': fee})
-                                
-                    elif diff_value < 0:
-                        if pct < -0.098: continue
-                        sell_value = abs(diff_value)
-                        if sell_value > max_trade_val and max_trade_val > 0: sell_value = max_trade_val
-                        shares_to_sell = int(sell_value / price / 100) * 100
-                        if shares_to_sell > 0:
-                            shares_to_sell = min(shares_to_sell, current_shares)
-                            revenue = shares_to_sell * price
-                            fee = max(revenue * COMMISSION, MIN_COMMISSION)
-                            cash += (revenue - fee)
-                            holdings[sym] -= shares_to_sell
-                            if holdings[sym] == 0: del holdings[sym]
-                            sell_val_total += revenue
-                            trades.append({'date': date, 'symbol': sym, 'action': 'SELL_REBALANCE', 'shares': shares_to_sell, 'price': price, 'fee': fee})
-
-                if pre_trade_nav > 0:
-                    total_traded = buy_val_total + sell_val_total
-                    turnover_rate = total_traded / (2 * pre_trade_nav)
-                    turnover_data.append({'date': date, 'turnover': turnover_rate, 'buy': buy_val_total, 'sell': sell_val_total, 'nav': pre_trade_nav})
-                    current_year_turnover += turnover_rate  # 累计年度换手率
-
-        # 更新当年最高市值
-        if portfolio_value > current_year_max_value:
-            current_year_max_value = portfolio_value
+                    if pre_trade_nav > 0:
+                        total_traded = buy_val_total + sell_val_total
+                        turnover_rate = total_traded / (2 * pre_trade_nav)
+                        turnover_data.append({'date': date, 'turnover': turnover_rate})
+                        current_year_turnover += turnover_rate
         
-        portfolio_values.append({
-            'date': date, 'value': portfolio_value, 'cash': cash,
-            'holdings_value': holdings_value, 'holdings_count': len(holdings)
-        })
+        portfolio_values.append({'date': date, 'value': portfolio_value, 'cash': cash, 'holdings_count': len(holdings)})
+        last_processed_date = date_ts
     
-    # 处理最后一年的收益记录
-    if len(trading_days) > 0:
+    # 最后一年
+    if len(trading_days) > 0 and last_processed_date is not None:
         last_date = pd.Timestamp(trading_days[-1])
         final_value = cash
         for sym, shares in holdings.items():
             price = last_known_prices.get(sym, 0)
             if price > 0:
                 final_value += shares * price
+                cost = holding_costs.get(sym, 0)
+                pnl = (price - cost) * shares
+                current_stock_pnl[sym] = current_stock_pnl.get(sym, 0) + pnl
         
-        # 找到当年第一个交易日
-        first_day_of_year = None
-        for d in trading_days:
-            if pd.Timestamp(d).year == last_date.year:
-                first_day_of_year = pd.Timestamp(d)
-                break
-        
-        if first_day_of_year and current_year_start_value > 0:
-            year_return = (final_value / current_year_start_value) - 1
-            year_max_drawdown = (current_year_max_value - final_value) / current_year_max_value if current_year_max_value > 0 else 0
-            
-            year_stats = {
-                'year': last_date.year,
-                'start_value': current_year_start_value,
-                'end_value': final_value,
-                'return': year_return,
-                'max_drawdown': year_max_drawdown,
-                'turnover': current_year_turnover
-            }
-            
-            # 合并 IC 和 Top10 统计
-            if last_date.year in yearly_ic_top10_stats:
-                year_stats.update(yearly_ic_top10_stats[last_date.year])
-            
-            yearly_returns.append(year_stats)
+        yearly_stock_pnl[last_date.year] = current_stock_pnl.copy()
+        ic_stats = calculate_yearly_ic_and_top10(predictions, last_date.year)
+        yearly_returns.append({
+            'year': last_date.year, 'start_value': current_year_start_value, 'end_value': final_value,
+            'return': (final_value / current_year_start_value) - 1, 'max_drawdown': 0, 
+            'turnover': current_year_turnover, **ic_stats
+        })
     
-    yearly_df = pd.DataFrame(yearly_returns)
-    if not yearly_df.empty:
-        print("\n" + "=" * 60)
-        print("YEARLY RETURNS (Annual Reset)")
-        print("=" * 60)
-        for _, row in yearly_df.iterrows():
-            print(f"Year {int(row['year'])}: {row['return']:>8.2%} ({row['start_value']:>12,.0f} -> {row['end_value']:>12,.0f}), MaxDD: {row['max_drawdown']:>7.2%}, Turnover: {row['turnover']:>6.2%}")
-        print("-" * 60)
-        print(f"Average Annual Return: {yearly_df['return'].mean():.2%}")
-        print(f"Winning Years: {(yearly_df['return'] > 0).sum()}/{len(yearly_df)}")
-        print("=" * 60)
-    
-    return pd.DataFrame(portfolio_values), pd.DataFrame(trades), pd.DataFrame(turnover_data), yearly_df
+    return pd.DataFrame(portfolio_values), pd.DataFrame(trades), pd.DataFrame(turnover_data), pd.DataFrame(yearly_returns), yearly_stock_pnl
 
 
-def calculate_metrics(yearly_df, turnover_df=None):
-    """
-    计算回测指标 (基于年度重置模式)
-    
-    参数:
-        yearly_df: DataFrame with columns ['year', 'start_value', 'end_value', 'return']
-        turnover_df: 换手率数据
-    """
-    if yearly_df.empty:
-        return {}
-    
-    # 年度收益率统计
-    yearly_returns = yearly_df['return'].values
-    years = len(yearly_returns)
-    
-    # 平均年化收益率 (算术平均)
-    annual_return = yearly_returns.mean()
-    
-    # 年度波动率 (年化收益率的标准差)
-    annual_volatility = yearly_returns.std()
-    
-    # 夏普比率 (假设无风险利率 2%)
-    risk_free_rate = 0.02
-    sharpe = (annual_return - risk_free_rate) / annual_volatility if annual_volatility > 0 else 0
-    
-    # 胜率 (正收益年份占比)
-    win_rate = (yearly_returns > 0).mean()
-    
-    # 最大回撤 (基于年度收益，这里定义为最大年度亏损)
-    max_drawdown = yearly_returns.min()
-    
-    # Calmar 比率 (年化收益 / 最大回撤的绝对值)
-    calmar = annual_return / abs(max_drawdown) if max_drawdown != 0 else 0
-    
-    # 总收益率 (几何平均的累计，从100万到最终)
-    total_return = np.prod(1 + yearly_returns) - 1
-    
-    # 复合年化收益率 (CAGR，几何平均)
-    cagr = (1 + total_return) ** (1 / years) - 1 if years > 0 else 0
-    
-    # 换手率
-    turnover_metrics = {}
-    if turnover_df is not None and len(turnover_df) > 0:
-        turnover_df = turnover_df.copy()
-        turnover_df['year'] = pd.to_datetime(turnover_df['date']).dt.year
-        yearly_turnover = turnover_df.groupby('year')['turnover'].sum()
-        turnover_metrics['avg_annual_turnover'] = yearly_turnover.mean()
-    else:
-        turnover_metrics['avg_annual_turnover'] = 0
-    
+def calculate_metrics(yearly_df):
+    if yearly_df.empty: return {}
+    rets = yearly_df['return'].values
     return {
-        'total_return': total_return,          # 累计总收益
-        'annual_return': annual_return,        # 平均年化收益 (算术)
-        'cagr': cagr,                          # 复合年化收益 (几何)
-        'annual_volatility': annual_volatility, # 年度波动率
-        'sharpe_ratio': sharpe,                # 夏普比率
-        'max_drawdown': max_drawdown,          # 最大年度回撤
-        'win_rate': win_rate,                  # 胜率
-        'calmar_ratio': calmar,                # Calmar 比率
-        'years': years,                        # 投资年数
-        'final_value': yearly_df['end_value'].iloc[-1],  # 最后一年结束价值
-        **turnover_metrics
+        'years': len(rets),
+        'annual_return': rets.mean(),
+        'sharpe_ratio': (rets.mean() - 0.02) / rets.std() if rets.std() > 0 else 0,
+        'max_drawdown': yearly_df['max_drawdown'].max()
     }
 
 
-def calculate_monthly_summary(df, turnover_df=None):
-    """
-    计算月度统计指标
-    返回: DataFrame [month, start_value, end_value, return, drawdown, turnover]
-    """
-    if df.empty:
-        return pd.DataFrame()
-    
-    df = df.copy()
-    df['date'] = pd.to_datetime(df['date'])
-    df['year_month'] = df['date'].dt.to_period('M')
-    
-    # 准备换手率数据
-    monthly_turnover = {}
-    if turnover_df is not None and not turnover_df.empty:
-        tdf = turnover_df.copy()
-        tdf['date'] = pd.to_datetime(tdf['date'])
-        tdf['year_month'] = tdf['date'].dt.to_period('M')
-        # 月度换手率 = sum(每日换手率)
-        monthly_turnover = tdf.groupby('year_month')['turnover'].sum().to_dict()
-    
-    summary_list = []
-    
-    for ym, month_data in df.groupby('year_month'):
-        start_val = month_data['value'].iloc[0]
-        end_val = month_data['value'].iloc[-1]
-        
-        # 月度收益
-        ret = (end_val / start_val) - 1
-        
-        # 月度最大回撤
-        # 注意：这里计算的是该月内的回撤，相对于该月内的最高点
-        month_data['cummax'] = month_data['value'].cummax()
-        month_data['dd'] = (month_data['value'] - month_data['cummax']) / month_data['cummax']
-        max_dd = month_data['dd'].min()
-        
-        # 换手率
-        turnover = monthly_turnover.get(ym, 0.0)
-        
-        summary_list.append({
-            'month': str(ym),
-            'start_value': start_val,
-            'end_value': end_val,
-            'return': ret,
-            'max_drawdown': max_dd,
-            'turnover': turnover
-        })
-        
-    summary_df = pd.DataFrame(summary_list)
-    
-    # 格式化为百分比形式，方便阅读
-    for col in ['return', 'max_drawdown', 'turnover']:
-        if col in summary_df.columns:
-            summary_df[col] = summary_df[col].apply(lambda x: f"{x:.2%}")
-            
-    return summary_df
-
-
-def plot_results(df, ic_data=None):
-    """绘图"""
+def plot_results(df):
     if df.empty: return
-    rows = 4 if ic_data else 3
-    fig, axes = plt.subplots(rows, 1, figsize=(14, 4 * rows))
-    
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
     axes[0].plot(df['date'], df['value'], label='Portfolio', color='blue')
     axes[0].set_title('Portfolio Value')
-    axes[0].grid(True, alpha=0.3)
     
-    df['cummax'] = df['value'].cummax()
-    df['drawdown'] = (df['value'] - df['cummax']) / df['cummax']
-    axes[1].fill_between(df['date'], df['drawdown'], 0, color='red', alpha=0.3)
+    df['dd'] = (df['value'] - df['value'].cummax()) / df['value'].cummax()
+    axes[1].fill_between(df['date'], df['dd'], 0, color='red', alpha=0.3)
     axes[1].set_title('Drawdown')
-    axes[1].grid(True, alpha=0.3)
     
-    axes[2].plot(df['date'], df['holdings_count'], label='Holdings', color='green')
+    axes[2].plot(df['date'], df['holdings_count'], color='green')
     axes[2].set_title('Holdings Count')
-    axes[2].grid(True, alpha=0.3)
-    
-    if ic_data:
-        ic_series, r20, r60, cum_ic = ic_data
-        axes[3].bar(ic_series.index, ic_series.values, color='gray', alpha=0.3, label='Daily IC')
-        axes[3].plot(r20.index, r20.values, color='blue', label='MA20')
-        axes[3].plot(r60.index, r60.values, color='orange', label='MA60')
-        ax4_twin = axes[3].twinx()
-        ax4_twin.plot(cum_ic.index, cum_ic.values, color='green', linestyle='--', label='Cum IC')
-        axes[3].set_title('IC Analysis')
     
     plt.tight_layout()
-    plt.savefig('backtest_results.png', dpi=150)
-    print("Saved plot to backtest_results.png")
+    plt.savefig('backtest_results.png')
+    print("Saved backtest_results.png")
 
 
 def main():
     print("=" * 60)
-    print("LightGBM v4 - Backtest with Limit/Amount Constraints")
-    print("=" * 60)
-    print(f"Configuration:")
-    print(f"  TOP_N: {TOP_N}, Buffer: {KEEP_TOP_N}")
-    print(f"  REBALANCE_DAYS: {REBALANCE_DAYS}")
-    print(f"  COMMISSION: {COMMISSION:.2%} (min {MIN_COMMISSION})")
-    print(f"  MAX_WEIGHT: {MAX_WEIGHT:.0%}")
-    print(f"  MAX_AMOUNT_RATIO: {MAX_AMOUNT_RATIO:.0%}")
-    print(f"  INITIAL_CASH: {INITIAL_CASH:,.0f}")
+    print("LightGBM Backtest - Advanced Analysis")
     print("=" * 60)
     
-    print("\nStep 1: Loading all data...")
+    print("\nStep 1: Loading data...")
     all_data, valid_symbols = load_and_merge_all_data()
     
-    print("\nStep 2: Generating signals (Parallel)...")
-    signals = generate_signals(all_data)
-    print(f"Generated {len(signals)} signals")
+    # 1. 特征漂移分析
+    analyze_feature_drift(all_data)
     
-    print("\nStep 3: Building data matrices...")
+    print("\nStep 2: Generating signals...")
+    signals = generate_signals(all_data)
+    
+    print("\nStep 3: Building matrices...")
     price_df, pre_close_df, amount_df, pct_change_df = build_data_matrices(all_data, valid_symbols)
     
-    print("\nStep 3.5: Analyzing IC...")
-    ic_data = analyze_ic(signals)
+    # 2. 月度 IC 分析
+    analyze_monthly_ic_plot(signals)
     
+    # 释放大内存
     del all_data
     import gc
     gc.collect()
     
     print("\nStep 4: Running backtest...")
-    results, trades, turnover_data, yearly_summary = backtest(
-        signals, price_df, pre_close_df, amount_df, pct_change_df, predictions=signals
+    results, trades, turnover_data, yearly_summary, yearly_stock_pnl = backtest(
+        signals, signals, price_df, pre_close_df, amount_df, pct_change_df
     )
     
-    print("\nStep 5: Calculating metrics...")
-    metrics = calculate_metrics(yearly_summary, turnover_data)
+    print("\nStep 5: Analysis...")
+    metrics = calculate_metrics(yearly_summary)
+    print(f"Avg Annual Return: {metrics.get('annual_return', 0):.2%}")
+    print(f"Sharpe Ratio: {metrics.get('sharpe_ratio', 0):.2f}")
     
-    print("\n" + "=" * 60)
-    print("BACKTEST RESULTS (Annual Reset Mode)")
-    print("=" * 60)
-    print(f"Period:              {metrics.get('years', 0):>15.0f} years")
-    print(f"Initial Value:       {INITIAL_CASH:>15,.0f}")
-    print(f"Final Value:         {metrics.get('final_value', 0):>15,.0f}")
-    print("-" * 60)
-    print(f"CAGR (Geometric):    {metrics.get('cagr', 0):>15.2%}")
-    print(f"Avg Annual Return:   {metrics.get('annual_return', 0):>15.2%}")
-    print(f"Annual Volatility:   {metrics.get('annual_volatility', 0):>15.2%}")
-    print("-" * 60)
-    print(f"Sharpe Ratio:        {metrics.get('sharpe_ratio', 0):>15.2f}")
-    print(f"Max Annual Drawdown: {metrics.get('max_drawdown', 0):>15.2%}")
-    print(f"Win Rate (Years):    {metrics.get('win_rate', 0):>15.2%}")
-    print(f"Calmar Ratio:        {metrics.get('calmar_ratio', 0):>15.2f}")
-    print("-" * 60)
-    print(f"Avg Annual Turnover: {metrics.get('avg_annual_turnover', 0):>10.2%}")
-    print("=" * 60)
+    # 3. 收益集中度分析
+    analyze_concentration(yearly_stock_pnl)
     
-    # 打印详细的年度总结表格（包含IC和Top10统计）
     if not yearly_summary.empty:
-        print("\n" + "=" * 140)
-        print("ANNUAL SUMMARY")
-        print("=" * 140)
-        print(f"{'Year':>6} | {'Start':>10} | {'End':>10} | {'Return':>8} | {'MaxDD':>7} | {'Turnover':>8} | {'IC Mean':>8} | {'IC Std':>7} | {'Top10 Mean':>10} | {'Top10 Med':>9} | {'Top10 Win':>9}")
-        print("-" * 140)
-        
-        for _, row in yearly_summary.iterrows():
-            year = int(row['year'])
-            start_val = row['start_value']
-            end_val = row['end_value']
-            ret = row['return']
-            max_dd = row['max_drawdown']
-            turnover = row['turnover']
-            ic_mean = row.get('ic_mean', np.nan)
-            ic_std = row.get('ic_std', np.nan)
-            top10_mean = row.get('top10_mean_ret', np.nan)
-            top10_median = row.get('top10_median_ret', np.nan)
-            top10_win = row.get('top10_pct_positive', np.nan)
-            
-            ic_mean_str = f"{ic_mean:>8.4f}" if not pd.isna(ic_mean) else "     N/A"
-            ic_std_str = f"{ic_std:>7.4f}" if not pd.isna(ic_std) else "    N/A"
-            top10_mean_str = f"{top10_mean:>9.2%}" if not pd.isna(top10_mean) else "      N/A"
-            top10_median_str = f"{top10_median:>8.2%}" if not pd.isna(top10_median) else "     N/A"
-            top10_win_str = f"{top10_win:>8.2%}" if not pd.isna(top10_win) else "     N/A"
-            
-            print(f"{year:>6} | {start_val:>10,.0f} | {end_val:>10,.0f} | {ret:>7.2%} | {max_dd:>6.2%} | {turnover:>7.2%} | {ic_mean_str} | {ic_std_str} | {top10_mean_str} | {top10_median_str} | {top10_win_str}")
-        
-        print("=" * 140)
-    
+        print("\nYEARLY SUMMARY:")
+        print(yearly_summary[['year', 'return', 'turnover', 'ic_mean', 'top10_mean_ret']].to_string(index=False))
+
     results.to_csv('backtest_results.csv', index=False)
-    trades.to_csv('backtest_trades.csv', index=False)
-    if not turnover_data.empty:
-        turnover_data.to_csv('backtest_turnover.csv', index=False)
-    if not yearly_summary.empty:
-        yearly_summary.to_csv('backtest_yearly_summary.csv', index=False)
-        print("Saved yearly summary to backtest_yearly_summary.csv")
-    
-    # Calculate and save monthly summary
-    monthly_summary = calculate_monthly_summary(results, turnover_data)
-    monthly_summary.to_csv('backtest_monthly_summary.csv', index=False)
-    print("Saved monthly summary to backtest_monthly_summary.csv")
-    
-    plot_results(results, ic_data)
+    yearly_summary.to_csv('backtest_yearly_summary.csv', index=False)
+    plot_results(results)
 
 
 if __name__ == "__main__":
