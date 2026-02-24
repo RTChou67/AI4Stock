@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-LightGBM 回测脚本 (Advanced Analysis Edition)
+LightGBM 回测脚本 (Debugged & Robust)
 配置：过去1年数据，预测20天收益，10天调仓
+输入：直接从 data/features 读取预计算好的特征
 特性：
 1. 每年年初重置资金
 2. 收益集中度分析 (Top-k Contribution)
@@ -17,16 +18,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import warnings
-from scipy import stats  # 用于 KS Test
+from scipy import stats 
 
 warnings.filterwarnings('ignore')
 
-DAILY_DIR = "data/daily"
+# 修改输入目录为 features
+DATA_DIR = "data/features"
 MODEL_DIR = "models_lgbm"
 
 TOP_N = 20
 KEEP_TOP_N = 30
-REBALANCE_DAYS = 10  # 持仓10天
+REBALANCE_DAYS = 10 
 
 INITIAL_CASH = 1_000_000
 COMMISSION = 0.00002
@@ -34,74 +36,60 @@ MIN_COMMISSION = 5
 MAX_WEIGHT = 0.05
 MAX_AMOUNT_RATIO = 0.02
 
+# ==== 新特征列表 (与 gen_feature.py 一致) ====
 BASE_FEATURES = [
-    'ret_1', 'ret_5', 'ret_10', 'ret_20', 'ret_40', 'ret_60',
-    'ma5_ratio', 'ma10_ratio', 'ma20_ratio',
-    'volatility_5', 'volatility_10', 'volatility_20',
-    'inv_volatility_5', 'inv_volatility_10', 'inv_volatility_20',
-    'vol_ratio', 'vol_ratio_20', 'new_high_ratio',
+    'ret_1', 'ret_5', 'ret_10', 'ret_20', 'ret_60',
+    'dist_ma5', 'dist_ma20', 'dist_ma60', 'dist_ma120',
+    'std_20', 'std_60', 'atr_14',
+    'vol_ratio_5', 'vol_ratio_20',
+    'rsi_14', 'macd_diff', 'hl_range',
+    'dist_high_20', 'dist_low_20'
 ]
 
-# 选几个代表性特征做漂移检测，避免输出太多
-DRIFT_CHECK_FEATURES = ['ret_20', 'volatility_20', 'ma20_ratio', 'new_high_ratio', 'vol_ratio']
-
-
-def compute_features(df):
-    df = df.copy()
-    df = df[df['close'] > 0]
-    df = df[df['volume'] > 0]
-    
-    df['raw_pct_change'] = df['close'].pct_change(1)
-    df['ret_1'] = df['raw_pct_change'].clip(-0.2, 0.2)
-    df['ret_5'] = df['close'].pct_change(5).clip(-0.5, 0.5)
-    df['ret_10'] = df['close'].pct_change(10)
-    df['ret_20'] = df['close'].pct_change(20).clip(-1, 1)
-    df['ret_40'] = df['close'].pct_change(40)
-    df['ret_60'] = df['close'].pct_change(60)
-    
-    df['ma5'] = df['close'].rolling(5).mean()
-    df['ma10'] = df['close'].rolling(10).mean()
-    df['ma20'] = df['close'].rolling(20).mean()
-    df['ma5_ratio'] = (df['close'] / df['ma5']).clip(0.5, 2)
-    df['ma10_ratio'] = (df['close'] / df['ma10']).clip(0.5, 2)
-    df['ma20_ratio'] = (df['close'] / df['ma20']).clip(0.5, 2)
-    
-    df['volatility_5'] = df['ret_1'].rolling(5).std().clip(lower=1e-4)
-    df['volatility_10'] = df['ret_1'].rolling(10).std().clip(lower=1e-4)
-    df['volatility_20'] = df['ret_1'].rolling(20).std().clip(lower=1e-4)
-    df['inv_volatility_5'] = 1 / df['volatility_5']
-    df['inv_volatility_10'] = 1 / df['volatility_10']
-    df['inv_volatility_20'] = 1 / df['volatility_20']
-    
-    df['vol_ma5'] = df['volume'].rolling(5).mean()
-    df['vol_ma20'] = df['volume'].rolling(20).mean()
-    df['vol_ratio'] = df['volume'] / df['vol_ma5']
-    df['vol_ratio_20'] = df['volume'] / df['vol_ma20']
-    
-    df['high_250'] = df['close'].rolling(250).max()
-    df['new_high_ratio'] = (df['close'] / df['high_250']).clip(0, 2)
-    
-    df['future_ret_20'] = df['close'].shift(-20) / df['close'] - 1
-    
-    return df
+# 选取代表性特征进行漂移检测
+DRIFT_CHECK_FEATURES = [
+    'ret_20', 'std_20', 'dist_ma60', 'atr_14', 'rsi_14', 'macd_diff'
+]
 
 
 def load_and_merge_all_data():
-    files = glob.glob(os.path.join(DAILY_DIR, "*.parquet"))
+    files = glob.glob(os.path.join(DATA_DIR, "*.parquet"))
     all_data = []
     
-    print(f"Loading {len(files)} files...")
+    print(f"Loading {len(files)} feature files from {DATA_DIR}...")
     for f in tqdm(files, desc="Loading"):
         try:
-            symbol = os.path.splitext(os.path.basename(f))[0]
             df = pd.read_parquet(f)
             if len(df) < 100:
                 continue
-            df = compute_features(df)
+            
+            # 补全 symbol
+            if 'symbol' not in df.columns:
+                symbol = os.path.splitext(os.path.basename(f))[0]
+                df['symbol'] = symbol
+                
             df['date'] = pd.to_datetime(df['date'])
-            df['symbol'] = symbol
-            cols = ['date', 'symbol'] + BASE_FEATURES + ['close', 'amount', 'raw_pct_change', 'future_ret_20']
-            df = df[cols].dropna(subset=BASE_FEATURES)
+            
+            # 确保 label 列名一致
+            if 'future_20d_ret' in df.columns:
+                df['future_ret_20'] = df['future_20d_ret']
+            
+            # 筛选必要列
+            # 注意：如果特征文件里没有 future_ret_20，这里会报错或被过滤
+            # 我们允许缺失 label (预测时不需要 label)，但在回测统计 IC 时需要
+            # 这里采取策略：尽量保留
+            
+            cols_to_keep = ['date', 'symbol', 'close', 'amount'] + BASE_FEATURES
+            if 'future_ret_20' in df.columns:
+                cols_to_keep.append('future_ret_20')
+            
+            # 检查特征列是否存在
+            missing = [c for c in cols_to_keep if c not in df.columns]
+            if missing:
+                # print(f"Missing cols in {f}: {missing}")
+                continue
+                
+            df = df[cols_to_keep].dropna(subset=BASE_FEATURES)
             if len(df) > 0:
                 all_data.append(df)
         except:
@@ -116,23 +104,21 @@ def load_and_merge_all_data():
     return merged, merged['symbol'].unique().tolist()
 
 
-# ==== 新增分析模块 ====
+# ==== 分析模块 ====
 
 def analyze_feature_drift(all_data):
-    """
-    检查特征分布漂移 (KS Test)
-    对比 每年数据 vs 全样本数据
-    """
     print("\n" + "=" * 60)
     print("FEATURE DRIFT ANALYSIS (KS Test)")
-    print("Compare each year's distribution vs Global distribution")
-    print("P-value < 0.01 implies significant drift")
     print("=" * 60)
     
+    if all_data.empty: return
+
     all_data['year'] = all_data['date'].dt.year
     years = sorted(all_data['year'].unique())
     
-    # 打印表头
+    # 过滤年份：仅检查 2021-2025
+    years = [y for y in years if 2021 <= y <= 2025]
+    
     header = f"{'Year':<6} | {'Feature':<15} | {'KS Stat':>8} | {'P-Value':>10} | {'Drift?'}"
     print(header)
     print("-" * len(header))
@@ -145,27 +131,17 @@ def analyze_feature_drift(all_data):
         for feat in DRIFT_CHECK_FEATURES:
             if feat not in all_data.columns: continue
             
-            # KS Test
-            # Null hypothesis: two samples are drawn from the same distribution
             stat, pval = stats.ks_2samp(year_data[feat], all_data[feat])
-            
             is_drift = "YES !!!" if pval < 0.01 else "No"
             if pval < 0.01: drift_count += 1
             
             print(f"{year:<6} | {feat:<15} | {stat:>8.4f} | {pval:>10.4f} | {is_drift}")
-        
-        if drift_count > 0:
-            print(f"    >> Year {year} has {drift_count} drifting features.")
         print("-" * len(header))
 
 
 def analyze_concentration(yearly_stock_pnl):
-    """
-    分析收益集中度：Top 10 股票贡献占比
-    """
     print("\n" + "=" * 80)
     print("PnL CONCENTRATION ANALYSIS")
-    print("Check if returns are driven by a few lucky stocks (High % is risky)")
     print("=" * 80)
     
     print(f"{'Year':<6} | {'Total PnL':>12} | {'Top10 PnL':>12} | {'Top10 %':>8} | {'Top1 PnL':>12} | {'Top1 %':>8}")
@@ -176,76 +152,59 @@ def analyze_concentration(yearly_stock_pnl):
         
         series = pd.Series(pnl_map)
         total_pnl = series.sum()
-        
-        # 按绝对值排序？不，通常看赚钱的票。看 Net PnL 排序。
         sorted_pnl = series.sort_values(ascending=False)
         
         top10_sum = sorted_pnl.head(10).sum()
         top1_sum = sorted_pnl.head(1).sum() if len(sorted_pnl) > 0 else 0
         
-        # 计算占比。如果总 PnL 是负的，占比解释起来比较奇怪，但数值上仍有意义
-        # 若 total_pnl 接近 0，避免除零
         if abs(total_pnl) < 1:
-            ratio10 = 0
-            ratio1 = 0
+            ratio10, ratio1 = 0, 0
         else:
             ratio10 = top10_sum / total_pnl
             ratio1 = top1_sum / total_pnl
             
         print(f"{year:<6} | {total_pnl:>12.0f} | {top10_sum:>12.0f} | {ratio10:>8.2%} | {top1_sum:>12.0f} | {ratio1:>8.2%}")
-
     print("=" * 80)
 
 
 def analyze_monthly_ic_plot(predictions):
-    """
-    绘制月度 IC 和 ICIR 图
-    """
     print("Analyzing Monthly IC...")
-    valid_preds = predictions.dropna(subset=['future_ret_20'])
-    if len(valid_preds) == 0: return
+    if predictions.empty:
+        print("Predictions are empty, skipping IC analysis.")
+        return
+        
+    if 'future_ret_20' not in predictions.columns:
+        print("No label 'future_ret_20' in predictions, skipping IC analysis.")
+        return
 
-    # 计算日频 IC
+    valid_preds = predictions.dropna(subset=['future_ret_20'])
+    if len(valid_preds) == 0: 
+        print("No valid predictions with labels, skipping IC analysis.")
+        return
+
     daily_ic = valid_preds.groupby('date').apply(
         lambda x: x['pred_ret'].corr(x['future_ret_20'], method='spearman')
     )
     
-    # 重采样为月频
+    # 修复：使用 'ME' 替代 'M'
     monthly_ic_mean = daily_ic.resample('ME').mean()
     monthly_ic_std = daily_ic.resample('ME').std()
     monthly_icir = monthly_ic_mean / monthly_ic_std
     
-    # 绘图
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
     
-    # 图1：月度 IC 均值
     color = ['red' if v < 0 else 'blue' for v in monthly_ic_mean.values]
     ax1.bar(monthly_ic_mean.index, monthly_ic_mean.values, color=color, alpha=0.7)
     ax1.axhline(0, color='black', linestyle='-', linewidth=0.5)
     ax1.set_title("Monthly Mean IC (Spearman)")
-    ax1.set_ylabel("IC")
-    ax1.grid(True, alpha=0.3)
     
-    # 图2：月度 ICIR
     ax2.plot(monthly_icir.index, monthly_icir.values, marker='o', linestyle='-', color='green')
     ax2.axhline(0, color='black', linestyle='-', linewidth=0.5)
-    ax2.set_title("Monthly ICIR (Mean IC / Std IC)")
-    ax2.set_ylabel("ICIR")
-    ax2.grid(True, alpha=0.3)
+    ax2.set_title("Monthly ICIR")
     
     plt.tight_layout()
     plt.savefig('backtest_ic_monthly.png', dpi=150)
     print("Saved backtest_ic_monthly.png")
-    
-    # 打印数据
-    print("\n[Monthly IC Summary]")
-    summary = pd.DataFrame({
-        'IC Mean': monthly_ic_mean,
-        'ICIR': monthly_icir
-    })
-    # 过滤掉NaN (某些月份可能没数据)
-    summary = summary.dropna()
-    print(summary.tail(12)) # 打印最后12个月
 
 
 # ==========================
@@ -264,8 +223,12 @@ def generate_signals(all_data):
         except:
             continue
     
+    # 修复：如果列表为空，直接返回空DF，避免 KeyError: 'date'
+    if not model_dates:
+        print("No models found in models_lgbm/ !")
+        return pd.DataFrame()
+    
     model_info_df = pd.DataFrame(model_dates).sort_values('date').reset_index(drop=True)
-    if model_info_df.empty: return pd.DataFrame()
 
     all_predictions = []
     current_model = None
@@ -274,6 +237,8 @@ def generate_signals(all_data):
     
     start_date = model_info_df['date'].min()
     predict_dates = [d for d in all_dates if d >= start_date]
+    
+    feature_mismatch_warned = False
     
     for date in tqdm(predict_dates, desc="Generating Signals"):
         valid_models = model_info_df[model_info_df['date'] < date]
@@ -300,25 +265,51 @@ def generate_signals(all_data):
             day_data[f'{col}_rank'] = day_data[col].rank(pct=True, method='average')
             
         valid_cols = [c for c in current_features if c in day_data.columns]
-        if len(valid_cols) != len(current_features): continue
+        
+        if len(valid_cols) != len(current_features): 
+            if not feature_mismatch_warned:
+                missing = list(set(current_features) - set(day_data.columns))
+                print(f"\n[WARNING] Feature mismatch! Model needs {len(current_features)}, found {len(valid_cols)}.")
+                print(f"Missing in data: {missing[:5]} ...")
+                print("Skipping predictions until models are retrained or data is fixed.")
+                feature_mismatch_warned = True
+            continue
             
         X = day_data[current_features]
         if len(X) > 0:
             day_data['pred_ret'] = current_model.predict(X, num_threads=1)
-            all_predictions.append(day_data[['date', 'symbol', 'pred_ret', 'close', 'future_ret_20']])
+            # 安全的列选择
+            cols_to_save = ['date', 'symbol', 'pred_ret', 'close']
+            if 'future_ret_20' in day_data.columns:
+                cols_to_save.append('future_ret_20')
+            else:
+                day_data['future_ret_20'] = np.nan
+                cols_to_save.append('future_ret_20')
+                
+            all_predictions.append(day_data[cols_to_save])
 
-    if not all_predictions: return pd.DataFrame()
+    if not all_predictions: 
+        print("\n[ERROR] No predictions generated! Check feature mismatch warning above.")
+        return pd.DataFrame()
+        
     return pd.concat(all_predictions, ignore_index=True).sort_values(['date', 'pred_ret'], ascending=[True, False])
 
 
 def build_data_matrices(all_data, valid_symbols):
     price_df = all_data.pivot(index='date', columns='symbol', values='close').sort_index()
     amount_df = all_data.pivot(index='date', columns='symbol', values='amount').sort_index()
-    pct_change_df = all_data.pivot(index='date', columns='symbol', values='raw_pct_change').sort_index()
+    
+    if 'ret_1' in all_data.columns:
+        pct_change_df = all_data.pivot(index='date', columns='symbol', values='ret_1').sort_index()
+    else:
+        pct_change_df = price_df.pct_change()
+        
     return price_df, price_df.shift(1), amount_df, pct_change_df
 
 
 def calculate_yearly_ic_and_top10(predictions, year):
+    if predictions.empty: return {'ic_mean': np.nan, 'ic_std': np.nan, 'top10_mean_ret': np.nan}
+    
     year_data = predictions[predictions['date'].dt.year == year]
     if len(year_data) == 0:
         return {'ic_mean': np.nan, 'ic_std': np.nan, 'top10_mean_ret': np.nan}
@@ -362,8 +353,8 @@ def backtest(signals, predictions, price_df, pre_close_df, amount_df, pct_change
     yearly_stock_pnl = {}
     current_stock_pnl = {}
     
-    holdings = {} # {symbol: shares}
-    holding_costs = {} # {symbol: average_cost}
+    holdings = {} 
+    holding_costs = {} 
     
     portfolio_values = []
     trades = []
@@ -577,7 +568,7 @@ def main():
     print("LightGBM Backtest - Advanced Analysis")
     print("=" * 60)
     
-    print("\nStep 1: Loading data...")
+    print("\nStep 1: Loading feature data...")
     all_data, valid_symbols = load_and_merge_all_data()
     
     # 1. 特征漂移分析
@@ -586,13 +577,16 @@ def main():
     print("\nStep 2: Generating signals...")
     signals = generate_signals(all_data)
     
+    if signals.empty:
+        print("[STOP] No signals generated. Please check feature mismatch warning above.")
+        return
+    
     print("\nStep 3: Building matrices...")
     price_df, pre_close_df, amount_df, pct_change_df = build_data_matrices(all_data, valid_symbols)
     
     # 2. 月度 IC 分析
     analyze_monthly_ic_plot(signals)
     
-    # 释放大内存
     del all_data
     import gc
     gc.collect()
