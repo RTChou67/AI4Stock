@@ -146,12 +146,9 @@ def fetch_one(symbol, known_start, args):
             if 'volume' in df.columns:
                 df['volume'] = df['volume'] / 100.0
                 
-            # 填补新浪缺失的列
-            if 'amount' not in df.columns and 'volume' in df.columns and 'close' in df.columns:
-                # 注意：此时 volume 已经是手了，算 amount(元) 需要 * 100
-                df['amount'] = df['volume'] * 100 * df['close'] 
-            if 'turnover' not in df.columns:
-                df['turnover'] = 0.0
+            # 统一单位：新浪 turnover 是小数，转为百分比 (与 hist 一致)
+            if 'turnover' in df.columns:
+                df['turnover'] = df['turnover'] * 100.0
 
         else:
             # === 东财源 (stock_zh_a_hist) ===
@@ -240,6 +237,11 @@ def main():
         print("Please specify a data source: --hist OR --sina")
         print("Or use --check to audit local data.")
         return
+
+    # Check 模式极速配置
+    if args.check:
+        args.workers = 16
+        args.sleep = 0.0
 
     # 安全起见，如果用东财且没开 proxy，强烈建议单线程长休眠
     if args.hist and not args.check:
