@@ -123,6 +123,18 @@ def load_all_data(files):
 
 
 def add_cross_sectional_rank(all_data):
+    # ==== 核心防污染机制：剔除妖股 ====
+    print("Filtering extreme volatility outliers (Top 1% per day)...")
+    # 计算每天 std_20 的百分位排名
+    all_data['std_20_pct'] = all_data.groupby('date')['std_20'].transform(lambda x: x.rank(pct=True))
+    # 丢弃每天波动率最大的前 1% 股票 (比如那些连板、天地板的妖股)
+    # 这让模型不再被这些无法用正常逻辑预测的噪声数据带偏
+    initial_len = len(all_data)
+    all_data = all_data[all_data['std_20_pct'] <= 0.99].copy()
+    all_data = all_data.drop(columns=['std_20_pct'])
+    filtered_len = len(all_data)
+    print(f"Dropped {initial_len - filtered_len} outlier rows.")
+
     print("Adding rank features...")
     rank_features = []
     for col in tqdm(BASE_FEATURES, desc="Ranking"):

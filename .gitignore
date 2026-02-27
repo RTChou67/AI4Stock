@@ -14,3 +14,4 @@ models_lgbm/
 *.csv
 *.png
 .env
+fetch_fails.log

@@ -45,14 +45,18 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # ======================
 # 初始化代理 (仅对东财生效)
 # ======================
-def init_proxy():
+def init_proxy(use_proxy=True):
+    if not use_proxy:
+        print("Skipping proxy patch as --no-proxy was specified.")
+        return
+        
     load_dotenv()
     AUTH_TOKEN = os.getenv("AKSHARE_PROXY_TOKEN", "")
     if AUTH_TOKEN:
         try:
             import akshare_proxy_patch
             # 重试次数设为 3，避免单次请求挂起太久
-            akshare_proxy_patch.install_patch("101.201.173.125", AUTH_TOKEN, 3)
+            akshare_proxy_patch.install_patch("101.201.173.125", AUTH_TOKEN, 30)
             print("Proxy patch installed.")
         except ImportError:
             print("Warning: akshare-proxy-patch not installed. Running without proxy.")
@@ -71,36 +75,69 @@ def format_symbol_for_sina(symbol):
 
 
 # ======================
-# 核心验证逻辑
+# 核心验证逻辑 (极速版 - 仅读取 Parquet 元数据)
 # ======================
+import pyarrow.parquet as pq
+
 def is_file_qualified(symbol, known_start_date=None):
     file_path = os.path.join(DATA_DIR, f"{symbol}.parquet")
-    if not os.path.exists(file_path): return False, "Missing"
+    if not os.path.exists(file_path): return "MISSING", "File not found"
+    
     try:
-        df = pd.read_parquet(file_path)
-        if df.empty: return False, "Empty"
+        meta = pq.read_metadata(file_path)
+        if meta.num_rows == 0: return "ERROR", "Empty file"
         
-        df['date'] = pd.to_datetime(df['date'])
+        schema_names = meta.schema.names
         
-        # 检查列
-        if not all(col in df.columns for col in EXPECTED_COLS):
-            return False, "Missing columns"
+        # 1. 检查列
+        if not all(col in schema_names for col in EXPECTED_COLS):
+            return "ERROR", "Missing columns"
             
-        start_date, end_date = df['date'].min(), df['date'].max()
+        # 2. 扫描 Row Groups 获取统计信息 (免加载数据)
+        nan_counts = 0
+        min_date = None
+        max_date = None
         
-        if end_date < TARGET_END_DATE: 
-            return False, f"End date early: {end_date.date()}"
+        for rg_idx in range(meta.num_row_groups):
+            rg = meta.row_group(rg_idx)
+            for col_idx in range(rg.num_columns):
+                col_meta = rg.column(col_idx)
+                col_name = schema_names[col_idx]
+                
+                # 统计缺失值 (仅针对 EXPECTED_COLS)
+                if col_name in EXPECTED_COLS and col_meta.is_stats_set:
+                    nc = col_meta.statistics.null_count
+                    if nc is not None:
+                        nan_counts += nc
+                        
+                # 获取日期极值
+                if col_name == 'date' and col_meta.is_stats_set:
+                    rg_min = pd.Timestamp(col_meta.statistics.min)
+                    rg_max = pd.Timestamp(col_meta.statistics.max)
+                    if min_date is None or rg_min < min_date: min_date = rg_min
+                    if max_date is None or rg_max > max_date: max_date = rg_max
+        
+        if nan_counts > 0:
+            return "ERROR", f"Contains {nan_counts} NaN values"
+            
+        if min_date is None or max_date is None:
+            return "ERROR", "Cannot read date statistics"
+            
+        # 3. 检查日期范围
+        if max_date < TARGET_END_DATE: 
+            return "ERROR", f"End date early: {max_date.date()}"
             
         effective_target = TARGET_START_DATE
         if known_start_date is not None: 
             effective_target = max(TARGET_START_DATE, pd.Timestamp(known_start_date))
             
-        if start_date > (effective_target + pd.Timedelta(days=3)): 
-            return False, f"Start date late: {start_date.date()}"
+        if min_date > (effective_target + pd.Timedelta(days=3)): 
+            # 这是一个 Warning，不算致命错误
+            return "WARNING", f"Start date late: {min_date.date()}"
             
-        return True, "Perfect"
-    except: 
-        return False, "Corrupted"
+        return "OK", "Perfect"
+    except Exception as e: 
+        return "ERROR", f"Corrupted: {str(e)}"
 
 
 # ======================
@@ -111,12 +148,20 @@ def fetch_one(symbol, known_start, args):
     
     if should_abort: return f"{symbol} ABORTED"
 
-    qualified, reason = is_file_qualified(symbol, known_start)
-    if qualified:
+    status, reason = is_file_qualified(symbol, known_start)
+    
+    # OK 和 WARNING 都不需要重新抓取全量
+    if status == "OK" or (status == "WARNING" and not args.check):
         with fail_lock: consecutive_fails = 0
         return f"{symbol} OK"
         
-    if args.check: return f"{symbol} INCOMPLETE ({reason})"
+    if args.check:
+        if status == "WARNING":
+            return f"{symbol} WARNING ({reason})"
+        elif status == "MISSING":
+            return f"{symbol} MISSING ({reason})"
+        else:
+            return f"{symbol} ERROR ({reason})"
 
     file_path = os.path.join(DATA_DIR, f"{symbol}.parquet")
     
@@ -229,6 +274,7 @@ def main():
     parser.add_argument("--check", action="store_true", help="Only check integrity")
     parser.add_argument("--sina", action="store_true", help="Use Sina daily API (fast but unstable IP limit)")
     parser.add_argument("--hist", action="store_true", help="Use EastMoney hist API (high quality, needs proxy)")
+    parser.add_argument("--no-proxy", action="store_true", help="Disable akshare-proxy-patch even if --hist is used")
     parser.add_argument("--workers", type=int, default=MAX_WORKERS, help="Number of concurrent workers")
     parser.add_argument("--sleep", type=float, default=SLEEP, help="Sleep time between requests")
     args = parser.parse_args()
@@ -245,7 +291,7 @@ def main():
 
     # 安全起见，如果用东财且没开 proxy，强烈建议单线程长休眠
     if args.hist and not args.check:
-        init_proxy()
+        init_proxy(use_proxy=not args.no_proxy)
         # 自动覆盖保守参数 (用户没手动指定的话)
         if args.workers == MAX_WORKERS: args.workers = 1
         if args.sleep == SLEEP: args.sleep = 1.0
@@ -291,11 +337,39 @@ def main():
                 df_info.loc[df_info['symbol'] == sym, 'first_date'] = d
             df_info.to_parquet(SYMBOL_CACHE_FILE, index=False)
 
+    # 写入错误日志
+    fail_log_path = "fetch_fails.log"
+    fails_and_errors = [r for r in results if "FAIL" in r or "ERROR" in r or "MISSING" in r]
+    if fails_and_errors:
+        with open(fail_log_path, "w", encoding="utf-8") as f:
+            f.write(f"--- Fetch Report: {pd.Timestamp.now()} ---\n")
+            for r in fails_and_errors:
+                f.write(f"{r}\n")
+        print(f"\n[INFO] Detailed failure reasons saved to {fail_log_path}")
+
     print("\n" + "="*40)
     print("DONE.")
     print(f"Perfect Files: {sum(1 for r in results if ' OK' in r)}")
-    print(f"Updated Files: {sum(1 for r in results if 'FETCHED' in r)}")
-    print(f"Failed Tasks : {sum(1 for r in results if 'FAIL' in r)}")
+    
+    if args.check:
+        missing_files = [r for r in results if "MISSING" in r]
+        errors = [r for r in results if "ERROR" in r]
+        warnings = [r for r in results if "WARNING" in r]
+        
+        print(f"Missing Files: {len(missing_files)}")
+        print(f"Errors (Need Re-fetch): {len(errors)}")
+        print(f"Warnings (e.g. Late Start): {len(warnings)}")
+        
+        if errors:
+            print("\n--- Problematic Files (Top 20 Errors) ---")
+            for r in errors[:20]:
+                print(f"  {r}")
+            if len(errors) > 20:
+                print(f"  ... and {len(errors) - 20} more errors.")
+    else:
+        print(f"Updated Files: {sum(1 for r in results if 'FETCHED' in r)}")
+        print(f"Failed Tasks : {sum(1 for r in results if 'FAIL' in r)}")
+        
     if should_abort: print("REASON: Program was stopped by circuit breaker.")
 
 if __name__ == "__main__":

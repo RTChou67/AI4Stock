@@ -299,12 +299,24 @@ def build_data_matrices(all_data, valid_symbols):
     price_df = all_data.pivot(index='date', columns='symbol', values='close').sort_index()
     amount_df = all_data.pivot(index='date', columns='symbol', values='amount').sort_index()
     
+    # 构建一字板标识: 如果最高价==最低价，说明今天全天没有波动（一字涨跌停或停牌）
+    # 对于停牌股，价格会保持前收盘价，但通常 volume 为 0，所以在后续可能也被过滤
+    # 这里我们严格标记 high == low 为不可交易 (True)
+    if 'high' in all_data.columns and 'low' in all_data.columns:
+        high_df = all_data.pivot(index='date', columns='symbol', values='high').sort_index()
+        low_df = all_data.pivot(index='date', columns='symbol', values='low').sort_index()
+        # 认为高低价非常接近的就是一字板
+        limit_locked_df = abs(high_df - low_df) < 1e-4
+    else:
+        # Fallback 兼容
+        limit_locked_df = pd.DataFrame(False, index=price_df.index, columns=price_df.columns)
+        
     if 'ret_1' in all_data.columns:
         pct_change_df = all_data.pivot(index='date', columns='symbol', values='ret_1').sort_index()
     else:
         pct_change_df = price_df.pct_change()
         
-    return price_df, price_df.shift(1), amount_df, pct_change_df
+    return price_df, price_df.shift(1), amount_df, pct_change_df, limit_locked_df
 
 
 def calculate_yearly_ic_and_top10(predictions, year):
@@ -335,7 +347,7 @@ def calculate_yearly_ic_and_top10(predictions, year):
     return {'ic_mean': ic_mean, 'ic_std': ic_std, 'top10_mean_ret': top10_mean_ret}
 
 
-def backtest(signals, predictions, price_df, pre_close_df, amount_df, pct_change_df):
+def backtest(signals, predictions, price_df, pre_close_df, amount_df, pct_change_df, limit_locked_df):
     if signals.empty:
         print("No signals!")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), {}
@@ -406,6 +418,8 @@ def backtest(signals, predictions, price_df, pre_close_df, amount_df, pct_change
         tradable_prices = {}
         day_amounts = {}
         day_pcts = {}
+        day_locked = {} # 记录一字板状态
+        
         if date_ts in price_df.index:
             today_row = price_df.loc[date_ts]
             valid_prices = today_row[today_row.notna() & (today_row > 0)]
@@ -413,6 +427,7 @@ def backtest(signals, predictions, price_df, pre_close_df, amount_df, pct_change
             tradable_prices = valid_prices.to_dict()
             if date_ts in amount_df.index: day_amounts = amount_df.loc[date_ts].to_dict()
             if date_ts in pct_change_df.index: day_pcts = pct_change_df.loc[date_ts].to_dict()
+            if date_ts in limit_locked_df.index: day_locked = limit_locked_df.loc[date_ts].to_dict()
         
         # 净值计算
         portfolio_value = cash
@@ -454,6 +469,7 @@ def backtest(signals, predictions, price_df, pre_close_df, amount_df, pct_change
                         if sym not in final_symbols:
                             if sym not in tradable_prices: continue
                             if day_pcts.get(sym, 0) < -0.098: continue
+                            if day_locked.get(sym, False): continue # 一字跌停无法卖出
                             
                             price = tradable_prices[sym]
                             shares = holdings[sym]
@@ -476,6 +492,7 @@ def backtest(signals, predictions, price_df, pre_close_df, amount_df, pct_change
                         if sym not in tradable_prices: continue
                         price = tradable_prices[sym]
                         if price <= 0 or day_pcts.get(sym, 0) > 0.098: continue
+                        if day_locked.get(sym, False): continue # 一字涨停无法买入
                         
                         current_shares = holdings.get(sym, 0)
                         diff_value = target_value_per_stock - (current_shares * price)
@@ -582,7 +599,7 @@ def main():
         return
     
     print("\nStep 3: Building matrices...")
-    price_df, pre_close_df, amount_df, pct_change_df = build_data_matrices(all_data, valid_symbols)
+    price_df, pre_close_df, amount_df, pct_change_df, limit_locked_df = build_data_matrices(all_data, valid_symbols)
     
     # 2. 月度 IC 分析
     analyze_monthly_ic_plot(signals)
@@ -593,7 +610,7 @@ def main():
     
     print("\nStep 4: Running backtest...")
     results, trades, turnover_data, yearly_summary, yearly_stock_pnl = backtest(
-        signals, signals, price_df, pre_close_df, amount_df, pct_change_df
+        signals, signals, price_df, pre_close_df, amount_df, pct_change_df, limit_locked_df
     )
     
     print("\nStep 5: Analysis...")
