@@ -22,4 +22,4 @@ cookies.json
 
 # Data files (except for the symbol cache if needed, but usually best to ignore all)
 data/
-!data/symbols_cache.parquet
+GEMINI.md
