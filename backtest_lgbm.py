@@ -27,7 +27,7 @@ DATA_DIR = "data/features"
 MODEL_DIR = "models_lgbm"
 
 TOP_N = 20
-KEEP_TOP_N = 30
+KEEP_TOP_N = 50
 REBALANCE_DAYS = 10 
 
 INITIAL_CASH = 1_000_000
@@ -43,7 +43,9 @@ BASE_FEATURES = [
     'std_20', 'std_60', 'atr_14',
     'vol_ratio_5', 'vol_ratio_20',
     'rsi_14', 'macd_diff', 'hl_range',
-    'dist_high_20', 'dist_low_20'
+    'vwap_ratio', 'corr_cv_20', 'skew_20', 'kurt_20',
+    'dist_high_20', 'dist_low_20',
+    'log_mcap', 'turnover'
 ]
 
 # 选取代表性特征进行漂移检测
@@ -437,7 +439,11 @@ def backtest(signals, predictions, price_df, pre_close_df, amount_df, pct_change
         
         if portfolio_value > current_year_max_value: current_year_max_value = portfolio_value
         
-        # 调仓
+        pre_trade_nav = portfolio_value
+        daily_sell_val = 0
+        daily_buy_val = 0
+
+        # ==== 2. 定期调仓 ====
         if date_ts in rebalance_set:
             prev_trade_idx = i - 1
             if prev_trade_idx >= 0:
@@ -450,26 +456,39 @@ def backtest(signals, predictions, price_df, pre_close_df, amount_df, pct_change
                     current_symbols = list(holdings.keys())
                     ranked_symbols = day_signals['symbol'].tolist()
                     symbol_rank = {sym: r for r, sym in enumerate(ranked_symbols)}
+                    symbol_score = dict(zip(day_signals['symbol'], day_signals['pred_ret']))
                     
-                    kept_symbols = [sym for sym in current_symbols if symbol_rank.get(sym, 9999) < KEEP_TOP_N]
+                    # 惰性换仓：如果已经在持仓中，只要排在前 50 名且预测分仍为正，就不卖
+                    kept_symbols = [sym for sym in current_symbols if symbol_rank.get(sym, 9999) < KEEP_TOP_N and symbol_score.get(sym, -1) > 0]
                     final_symbols = list(kept_symbols)
                     for sym in ranked_symbols:
                         if len(final_symbols) >= TOP_N: break
-                        if sym not in final_symbols: final_symbols.append(sym)
+                        if sym not in final_symbols and symbol_score.get(sym, -1) > 0: 
+                            final_symbols.append(sym)
                     
-                    pre_trade_nav = portfolio_value
-                    n_stocks = len(final_symbols)
-                    target_weight = min(1.0 / n_stocks if n_stocks > 0 else 0, MAX_WEIGHT)
+                    # 动态权重分配
+                    target_scores = {}
+                    for sym in final_symbols:
+                        score = day_signals.loc[day_signals['symbol'] == sym, 'pred_ret'].values
+                        if len(score) > 0 and score[0] > 0: 
+                            target_scores[sym] = score[0]
                     
-                    buy_val_total = 0
-                    sell_val_total = 0
+                    n_stocks = len(target_scores)
+                    target_weights = {}
                     
-                    # Sell
+                    if n_stocks > 0:
+                        total_score = sum(target_scores.values())
+                        for sym, score in target_scores.items():
+                            raw_weight = score / total_score
+                            dynamic_max_weight = max(MAX_WEIGHT, 0.10) 
+                            target_weights[sym] = min(raw_weight, dynamic_max_weight)
+                    
+                    # 卖出
                     for sym in list(holdings.keys()):
-                        if sym not in final_symbols:
+                        if sym not in final_symbols or sym not in target_weights:
                             if sym not in tradable_prices: continue
                             if day_pcts.get(sym, 0) < -0.098: continue
-                            if day_locked.get(sym, False): continue # 一字跌停无法卖出
+                            if day_locked.get(sym, False): continue 
                             
                             price = tradable_prices[sym]
                             shares = holdings[sym]
@@ -483,16 +502,19 @@ def backtest(signals, predictions, price_df, pre_close_df, amount_df, pct_change
                             
                             del holdings[sym]
                             del holding_costs[sym]
-                            sell_val_total += sell_val
+                            daily_sell_val += sell_val
                             trades.append({'date': date, 'symbol': sym, 'action': 'SELL', 'shares': shares, 'price': price, 'fee': fee, 'pnl': pnl})
                     
-                    # Buy
-                    target_value_per_stock = portfolio_value * target_weight
+                    # 买入
                     for sym in final_symbols:
+                        if sym not in target_weights: continue 
+                        
+                        target_weight = target_weights[sym]
+                        target_value_per_stock = pre_trade_nav * target_weight
                         if sym not in tradable_prices: continue
                         price = tradable_prices[sym]
                         if price <= 0 or day_pcts.get(sym, 0) > 0.098: continue
-                        if day_locked.get(sym, False): continue # 一字涨停无法买入
+                        if day_locked.get(sym, False): continue 
                         
                         current_shares = holdings.get(sym, 0)
                         diff_value = target_value_per_stock - (current_shares * price)
@@ -516,14 +538,15 @@ def backtest(signals, predictions, price_df, pre_close_df, amount_df, pct_change
                                     new_avg_cost = (prev_shares * prev_cost + cost + fee) / new_shares
                                     holdings[sym] = new_shares
                                     holding_costs[sym] = new_avg_cost
-                                    buy_val_total += cost
+                                    daily_buy_val += cost
                                     trades.append({'date': date, 'symbol': sym, 'action': 'BUY', 'shares': shares_buy, 'price': price, 'fee': fee})
                     
-                    if pre_trade_nav > 0:
-                        total_traded = buy_val_total + sell_val_total
-                        turnover_rate = total_traded / (2 * pre_trade_nav)
-                        turnover_data.append({'date': date, 'turnover': turnover_rate})
-                        current_year_turnover += turnover_rate
+        # ==== 3. 统计换手率 ====
+        total_traded = daily_buy_val + daily_sell_val
+        if total_traded > 0 and pre_trade_nav > 0:
+            turnover_rate = total_traded / (2 * pre_trade_nav)
+            turnover_data.append({'date': date, 'turnover': turnover_rate})
+            current_year_turnover += turnover_rate
         
         portfolio_values.append({'date': date, 'value': portfolio_value, 'cash': cash, 'holdings_count': len(holdings)})
         last_processed_date = date_ts
@@ -551,14 +574,24 @@ def backtest(signals, predictions, price_df, pre_close_df, amount_df, pct_change
     return pd.DataFrame(portfolio_values), pd.DataFrame(trades), pd.DataFrame(turnover_data), pd.DataFrame(yearly_returns), yearly_stock_pnl
 
 
-def calculate_metrics(yearly_df):
+def calculate_metrics(yearly_df, trades_df=None):
     if yearly_df.empty: return {}
     rets = yearly_df['return'].values
+    
+    # 计算交易胜率 (Trade Win Rate)
+    trade_win_rate = 0.0
+    if trades_df is not None and not trades_df.empty:
+        sell_trades = trades_df[trades_df['action'].isin(['SELL', 'STOP_LOSS', 'TAKE_PROFIT'])]
+        if not sell_trades.empty and 'pnl' in sell_trades.columns:
+            winning_trades = len(sell_trades[sell_trades['pnl'] > 0])
+            trade_win_rate = winning_trades / len(sell_trades)
+            
     return {
         'years': len(rets),
         'annual_return': rets.mean(),
         'sharpe_ratio': (rets.mean() - 0.02) / rets.std() if rets.std() > 0 else 0,
-        'max_drawdown': yearly_df['max_drawdown'].max()
+        'max_drawdown': yearly_df['max_drawdown'].max(),
+        'trade_win_rate': trade_win_rate
     }
 
 
@@ -614,9 +647,10 @@ def main():
     )
     
     print("\nStep 5: Analysis...")
-    metrics = calculate_metrics(yearly_summary)
+    metrics = calculate_metrics(yearly_summary, trades)
     print(f"Avg Annual Return: {metrics.get('annual_return', 0):.2%}")
     print(f"Sharpe Ratio: {metrics.get('sharpe_ratio', 0):.2f}")
+    print(f"Trade Win Rate: {metrics.get('trade_win_rate', 0):.2%}")
     
     # 3. 收益集中度分析
     analyze_concentration(yearly_stock_pnl)

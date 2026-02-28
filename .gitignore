@@ -9,9 +9,17 @@ wheels/
 # Virtual environments
 .venv
 
+# Models and results
 models_lgbm/
-
 *.csv
 *.png
+*.txt
+*.log
+
+# Sensitive info
 .env
-fetch_fails.log
+cookies.json
+
+# Data files (except for the symbol cache if needed, but usually best to ignore all)
+data/
+!data/symbols_cache.parquet

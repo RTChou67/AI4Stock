@@ -23,7 +23,7 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 N_JOBS = 16
 MIN_PRICE, MAX_PRICE = 2.0, 1000.0
-MIN_AVG_VOLUME = 1000000
+MIN_AVG_AMOUNT = 10000000 # 日均成交额 1000 万元
 MIN_LISTING_DAYS = 60
 
 DATA_START_YEAR = 2020  
@@ -37,7 +37,9 @@ BASE_FEATURES = [
     'std_20', 'std_60', 'atr_14',
     'vol_ratio_5', 'vol_ratio_20',
     'rsi_14', 'macd_diff', 'hl_range',
-    'dist_high_20', 'dist_low_20'
+    'vwap_ratio', 'corr_cv_20', 'skew_20', 'kurt_20',
+    'dist_high_20', 'dist_low_20',
+    'log_mcap', 'turnover'
 ]
 
 # 调试计数器
@@ -46,14 +48,14 @@ DEBUG_MAX_PRINT = 10
 
 def filter_stock(df):
     if len(df) < MIN_LISTING_DAYS: return "Too few rows"
-    if df['close'].isna().all() or df['volume'].isna().all(): return "All NaN"
+    if df['close'].isna().all() or df['amount'].isna().all(): return "All NaN"
     recent = df.tail(20)
     recent = recent[recent['close'] > 0]
     if len(recent) < 10: return "Recent < 10"
     avg_price = recent['close'].mean()
     if avg_price < MIN_PRICE or avg_price > MAX_PRICE: return f"Price {avg_price:.2f} out of range"
-    avg_volume = recent['volume'].mean()
-    if pd.isna(avg_volume) or avg_volume < MIN_AVG_VOLUME: return f"Vol {avg_volume:.0f} too low"
+    avg_amount = recent['amount'].mean()
+    if pd.isna(avg_amount) or avg_amount < MIN_AVG_AMOUNT: return f"Amount {avg_amount:.0f} too low"
     return True
 
 
@@ -85,11 +87,9 @@ def process_one_file(filepath):
             symbol = os.path.splitext(os.path.basename(filepath))[0]
             df['symbol'] = symbol
             
-        # ==== 加载 Sharpe Label ====
-        if 'future_20d_sharpe' in df.columns:
-            df['label'] = df['future_20d_sharpe']
-        elif 'future_20d_ret' in df.columns:
-            df['label'] = df['future_20d_ret']
+        # ==== 加载 Return Label (回归纯收益) ====
+        if 'future_20d_ret' in df.columns:
+            df['label'] = df['future_20d_ret'].clip(-0.5, 0.5) # 稍微做一点软截断，防止极端崩盘股影响
         else:
             if DEBUG_FAIL_COUNT < DEBUG_MAX_PRINT: print(f"Skip {filepath}: No label col found")
             DEBUG_FAIL_COUNT += 1
@@ -109,13 +109,19 @@ def process_one_file(filepath):
         return None
 
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 def load_all_data(files):
-    print(f"Loading feature data from {DATA_DIR}...")
+    print(f"Loading feature data from {DATA_DIR} (Parallel)...")
     dfs = []
-    for f in tqdm(files, desc="Loading"):
-        result = process_one_file(f)
-        if result is not None: dfs.append(result)
-        
+    
+    with ProcessPoolExecutor(max_workers=os.cpu_count() - 1) as executor:
+        futures = {executor.submit(process_one_file, f): f for f in files}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Loading"):
+            result = future.result()
+            if result is not None:
+                dfs.append(result)
+                
     print(f"Loaded {len(dfs)} valid stocks out of {len(files)}")
     if len(dfs) == 0: return None
     all_data = pd.concat(dfs, ignore_index=True)
@@ -134,6 +140,13 @@ def add_cross_sectional_rank(all_data):
     all_data = all_data.drop(columns=['std_20_pct'])
     filtered_len = len(all_data)
     print(f"Dropped {initial_len - filtered_len} outlier rows.")
+
+    # ==== 核心进化：大盘中性化 (Excess Return) ====
+    print("Calculating cross-sectional excess return (Market Neutralization)...")
+    # 计算每天全市场的平均收益
+    daily_mean_label = all_data.groupby('date')['label'].transform('mean')
+    # 标签变为：个股收益 - 全市场平均收益 (即 Alpha 超额收益)
+    all_data['label'] = all_data['label'] - daily_mean_label
 
     print("Adding rank features...")
     rank_features = []
@@ -186,7 +199,7 @@ def train_model_for_date(target_date, all_data, rank_features):
     valid_set = lgb.Dataset(X_valid, label=y_valid, reference=train_set)
     
     params = {
-        'objective': 'regression', 
+        'objective': 'huber', 
         'metric': 'rmse',
         'learning_rate': 0.05,
         'num_leaves': 31,
@@ -212,7 +225,7 @@ def train_model_for_date(target_date, all_data, rank_features):
         'best_iteration': model.best_iteration,
         'best_score': model.best_score,
         'train_date': target_date,
-        'target_type': 'sharpe' 
+        'target_type': 'return' 
     }
     joblib.dump(model_data, model_path)
     
@@ -222,8 +235,8 @@ def train_model_for_date(target_date, all_data, rank_features):
 
 def main():
     print("=" * 60)
-    print("LightGBM Training (Sharpe Target)")
-    print(f"Label: future_20d_sharpe (Future Ret / Future Vol)")
+    print("LightGBM Training (Return Target with Top 1% Volatility Filter)")
+    print(f"Label: future_20d_ret (Clipped at +/- 50%)")
     print("=" * 60)
     
     files = [os.path.join(DATA_DIR, f) for f in os.listdir(DATA_DIR) if f.endswith(".parquet")]
@@ -253,15 +266,56 @@ def main():
     train_dates = sorted(list(set(train_dates)))
     print(f"Total models to train: {len(train_dates)}")
     
+    all_models = []
+    
     for target_date in tqdm(train_dates, desc="Training"):
         try:
             date_str = target_date.strftime('%Y%m%d')
             model_path = os.path.join(MODEL_DIR, f"lgbm_{date_str}.pkl")
-            if os.path.exists(model_path): continue
-            train_model_for_date(target_date, all_data, rank_features)
+            
+            # 如果文件已存在，直接加载以便后续统计重要性
+            if os.path.exists(model_path):
+                model_data = joblib.load(model_path)
+                all_models.append(model_data['model'])
+                continue
+                
+            res = train_model_for_date(target_date, all_data, rank_features)
+            # 刚训练完的也加载进来
+            if "Done" in res:
+                model_data = joblib.load(model_path)
+                all_models.append(model_data['model'])
         except Exception as e:
             print(f"Error {target_date}: {e}")
     
+    print("\n" + "=" * 60)
+    print("FEATURE IMPORTANCE ANALYSIS (Average Gain)")
+    print("=" * 60)
+    
+    if all_models:
+        importances = np.zeros(len(rank_features))
+        for m in all_models:
+            importances += m.feature_importance(importance_type='gain')
+        
+        importances /= len(all_models)
+        
+        # 构建 DataFrame 并排序
+        fi_df = pd.DataFrame({
+            'Feature': rank_features,
+            'Average_Gain': importances
+        }).sort_values('Average_Gain', ascending=False).reset_index(drop=True)
+        
+        # 计算相对重要性 (占比)
+        total_gain = fi_df['Average_Gain'].sum()
+        fi_df['Relative_Importance(%)'] = (fi_df['Average_Gain'] / total_gain) * 100
+        
+        print(fi_df.to_string(index=False, formatters={'Average_Gain': '{:.2f}'.format, 'Relative_Importance(%)': '{:.2f}%'.format}))
+        
+        # 保存到本地
+        fi_df.to_csv('feature_importance.csv', index=False)
+        print("\nSaved feature importance to 'feature_importance.csv'")
+    else:
+        print("No valid models found for importance analysis.")
+
     print("\nDone!")
 
 
